@@ -12,7 +12,7 @@ The preview loads React, Leaflet and Lucide from unpkg, so you need an internet 
 npm install
 npm run dev          # http://localhost:5173 on this computer
 npm run dev:phone    # HTTPS on your Wi-Fi, so the camera and GPS work on your phone
-npm run build        # production build in /dist (service worker + offline map tiles)
+
 ```
 `dev:phone` prints a `https://192.168.x.x:5173` address. Open it on your phone and accept the self-signed certificate warning.
 To install it as a home-screen app, deploy `/dist` to any HTTPS host (Netlify, Vercel, GitHub Pages). Then use "Add to Home Screen".
