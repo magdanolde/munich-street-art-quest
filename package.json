@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "dev:phone": "vite --host --mode phone",
-    "build": "vite build",
+    "build": "npx vite build",
     "preview": "vite preview --host"
   },
   "dependencies": {
