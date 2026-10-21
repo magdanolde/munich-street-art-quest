@@ -54,17 +54,25 @@ const STORAGE_KEY = 'muc-art-quest/v1';
 /**
  * Optional runtime overrides via `window.MQ_CONFIG` (used by the hosted preview,
  * which can't load map tiles, the live camera or GPS). The normal app needs none.
- *   basemap: 'tiles' (CartoDB Dark Matter, default) | 'sketch' (built-in pixel sketch map)
+ *   basemap: 'sketch' forces the built-in pixel sketch map
+ *   cartoKey: CARTO basemaps key (alternative to the VITE_CARTO_KEY env variable)
  *   liveCamera: false hides the in-app live viewfinder (Snap/Upload still work)
  *   gpsBlockedMessage: custom toast when location access is refused
  */
 const RUNTIME = (typeof window !== 'undefined' && window.MQ_CONFIG) || {};
-const BASEMAP = RUNTIME.basemap === 'sketch' ? 'sketch' : 'tiles';
+
+/**
+ * CARTO Dark Matter tiles need a free key (since Sept 2026): https://carto.com/basemaps/apikey
+ * Put it in `.env.local` as VITE_CARTO_KEY=... (and in Vercel → Settings → Environment Variables).
+ * Without a key the app shows the built-in sketch map instead of watermarked tiles.
+ */
+const CARTO_KEY = (RUNTIME.cartoKey || import.meta.env?.VITE_CARTO_KEY || '').trim();
+const BASEMAP = RUNTIME.basemap === 'sketch' || !CARTO_KEY ? 'sketch' : 'tiles';
 const LIVE_CAMERA = RUNTIME.liveCamera !== false;
 const SCAN_DURATION_MS = 2000;
 const OUTSIDE_MUNICH_METERS = 30000;
 
-const TILE_URL = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+const TILE_URL = `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=${encodeURIComponent(CARTO_KEY)}`;
 const TILE_ATTRIBUTION =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
 
