@@ -4,17 +4,22 @@
  * Single-file, mobile-first React app.
  * Stack: React 18+, Tailwind CSS (utility classes), Leaflet, lucide-react.
  *
+ * How a spot is collected
+ *   1. Walk there (Map + live distance/direction radar on the Check In tab).
+ *   2. Check in: allowed only when your phone's GPS puts you within CHECKIN_RADIUS_M.
+ *   3. Bonus question: pick what the artwork shows (motif hidden until you're there).
+ *
  * File map (top → bottom)
  *   1. Config & theme tokens
- *   2. Built-in dataset (17 Munich street-art spots)
- *   3. Utilities (distance, image downscaling, seeded random)
- *   4. Hooks (persistent save, chiptune sound FX, toast)
- *   5. Shared UI atoms (PixelArt, CategoryChip, Toast, Confetti)
+ *   2. Built-in dataset (17 Munich street-art spots, 3-level hints)
+ *   3. Utilities (distance, bearing, quiz builder, seeded random)
+ *   4. Hooks (save game, chiptune sound FX, toast, GPS watch, compass)
+ *   5. Shared UI atoms (PixelArt, chips, HintStack, Toast, Confetti)
  *   6. App shell (Header, BottomNav)
- *   7. Tab 1 — MapView (+ FilterBar, ArtworkDrawer)
- *   8. Tab 2 — ScanView (+ viewfinder, AI analysis overlay)
+ *   7. Tab 1 — MapView (+ sketch basemap, FilterBar, ArtworkDrawer)
+ *   8. Tab 2 — CheckInView (+ Radar)
  *   9. Tab 3 — CollectionView (+ ArtworkCard)
- *  10. RewardModal
+ *  10. CheckInModal (bonus quiz → reward)
  *  11. Global CSS (fonts, keyframes, Leaflet overrides)
  *  12. <App /> (default export)
  */
@@ -23,22 +28,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import {
-  Camera,
   Check,
   ChevronDown,
+  Compass,
   Crosshair,
   Footprints,
-  ImagePlus,
   Lightbulb,
   LocateFixed,
   Lock,
   MapPin,
   Navigation,
   RotateCcw,
-  ScanLine,
   Sparkles,
-  Video,
-  VideoOff,
   Volume2,
   VolumeX,
   X,
@@ -51,26 +52,30 @@ import {
 const MUNICH_CENTER = [48.1351, 11.582];
 const STORAGE_KEY = 'muc-art-quest/v1';
 
+/** Check-in rules. */
+const CHECKIN_RADIUS_M = 75; // must be this close to the pin
+const MAX_GPS_ACCURACY_M = 100; // readings vaguer than this can't be used to check in
+const BONUS_POINTS = 25; // for answering the motif question correctly
+const OUTSIDE_MUNICH_METERS = 30000;
+
 /**
- * Optional runtime overrides via `window.MQ_CONFIG` (used by the hosted preview,
- * which can't load map tiles, the live camera or GPS). The normal app needs none.
+ * Optional runtime overrides via `window.MQ_CONFIG` (used by previews). The normal app needs none.
  *   basemap: 'sketch' forces the built-in pixel sketch map
  *   cartoKey: CARTO basemaps key (alternative to the VITE_CARTO_KEY env variable)
- *   liveCamera: false hides the in-app live viewfinder (Snap/Upload still work)
- *   gpsBlockedMessage: custom toast when location access is refused
+ *   demoCheckIn: true shows a "pretend I'm here" button (previews and local dev only)
+ *   gpsBlockedMessage: custom text when location access is refused
  */
 const RUNTIME = (typeof window !== 'undefined' && window.MQ_CONFIG) || {};
+const ENV = import.meta.env || {};
 
 /**
  * CARTO Dark Matter tiles need a free key (since Sept 2026): https://carto.com/basemaps/apikey
  * Put it in `.env.local` as VITE_CARTO_KEY=... (and in Vercel → Settings → Environment Variables).
  * Without a key the app shows the built-in sketch map instead of watermarked tiles.
  */
-const CARTO_KEY = (RUNTIME.cartoKey || import.meta.env?.VITE_CARTO_KEY || '').trim();
+const CARTO_KEY = String(RUNTIME.cartoKey || ENV.VITE_CARTO_KEY || '').trim();
 const BASEMAP = RUNTIME.basemap === 'sketch' || !CARTO_KEY ? 'sketch' : 'tiles';
-const LIVE_CAMERA = RUNTIME.liveCamera !== false;
-const SCAN_DURATION_MS = 2000;
-const OUTSIDE_MUNICH_METERS = 30000;
+const DEMO_CHECKIN = RUNTIME.demoCheckIn === true || ENV.DEV === true;
 
 const TILE_URL = `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=${encodeURIComponent(CARTO_KEY)}`;
 const TILE_ATTRIBUTION =
@@ -91,9 +96,34 @@ const C = {
 };
 
 const CATEGORIES = {
-  pixel: { id: 'pixel', label: 'Pixel Mosaics', emoji: '👾', color: C.pink, tint: '#ffe0f0', points: 50 },
-  mural: { id: 'mural', label: 'Mega Murals', emoji: '🎨', color: C.lavender, tint: '#ece6ff', points: 100 },
-  legal: { id: 'legal', label: 'Legal Walls', emoji: '🏛️', color: C.mint, tint: '#dcfbef', points: 75 },
+  pixel: {
+    id: 'pixel',
+    label: 'Pixel Mosaics',
+    emoji: '👾',
+    color: C.pink,
+    tint: '#ffe0f0',
+    points: 50,
+    lookFor:
+      'A small mosaic of square tiles, often between hand-size and pizza-box-size. Usually 2.5–4 m up: on building corners, above shop signs or next to street-name plates. Walk slowly and look up.',
+  },
+  mural: {
+    id: 'mural',
+    label: 'Mega Murals',
+    emoji: '🎨',
+    color: C.lavender,
+    tint: '#ece6ff',
+    points: 100,
+    lookFor: 'A painting covering most of a wall, often a side wall or the bare end wall of a building. Look across the street, not just in front of you.',
+  },
+  legal: {
+    id: 'legal',
+    label: 'Legal Walls',
+    emoji: '🏛️',
+    color: C.mint,
+    tint: '#dcfbef',
+    points: 75,
+    lookFor: 'A long wall covered top to bottom in graffiti. The pieces change every few days, so it never looks the same twice.',
+  },
 };
 
 const FILTERS = [
@@ -111,13 +141,6 @@ const RANKS = [
   { min: 1, title: 'MUC Legend' },
 ];
 
-const SCAN_STEPS = [
-  'Detecting pixel tiles…',
-  'Matching motif fingerprint…',
-  'Cross-checking GPS zone…',
-  'Consulting the lore archive…',
-];
-
 /** Reusable class strings for the chunky pixel look. */
 const PX_BORDER = 'border-[3px] border-[#141024]';
 const PX_SHADOW = 'shadow-[3px_3px_0_#141024]';
@@ -126,6 +149,14 @@ const PX_BTN = `mq-press ${PX_BORDER} ${PX_SHADOW}`;
 /* ========================================================================== */
 /* 2. DATASET                                                                  */
 /* ========================================================================== */
+/*
+ * hint   → level 1: the area (always shown)
+ * closer → level 2: where around the pin to search (tap "More help")
+ * quiz   → optional custom bonus question: { question, answer, options: [4 strings incl. answer] }
+ *          Without it, the question is "What does this artwork show?" built from the motifs.
+ * Hints describe the surroundings of each pin. If you find a piece somewhere else on site,
+ * update its lat/lng and `closer` text.
+ */
 
 const ARTWORKS = [
   // ---- Pixel Mosaics (Invader) -------------------------------------------
@@ -137,7 +168,8 @@ const ARTWORKS = [
     lng: 11.5676,
     district: 'Old Town',
     category: 'pixel',
-    hint: 'Look up around the medieval gate where the Altstadt ring meets the U-Bahn hub.',
+    hint: 'At the medieval city gate where the Altstadt ring meets the U-Bahn hub (U1/U2/U3/U6).',
+    closer: 'The pin sits right at the gate. Walk around both hexagonal towers and the buildings facing the square, and check the corners about 3 m up, above the shop signs.',
     trivia: 'Sendlinger Tor is one of three gates that survive from Munich’s old city wall.',
     lore: 'The gate was built in the 14th century to guard the road south to the village of Sendling. In the early 1900s its passages were merged into one wide arch for traffic, leaving the two hexagonal side towers you see today. The Münchner Kindl — the little hooded monk on the city’s coat of arms — has stood for Munich since the Middle Ages, so a pretzel-and-Kindl mosaic here is pure hometown pride.',
   },
@@ -149,7 +181,8 @@ const ARTWORKS = [
     lng: 11.5761,
     district: 'Old Town',
     category: 'pixel',
-    hint: 'Hunt among the market stalls, close to the blue-and-white maypole.',
+    hint: 'Munich’s big open-air food market, a two-minute walk south-east of Marienplatz.',
+    closer: 'The pin is in the middle of the market near the blue-and-white maypole. Check the walls of the permanent stall buildings and the corners of the houses around the market’s edge, above head height.',
     trivia: 'Munich’s favourite food market moved here from Marienplatz in 1807.',
     lore: 'King Max I Joseph ordered the farmers’ market out of the crowded Marienplatz in 1807, and it has grown ever since into a maze of stalls selling radishes, cheese, flowers and Weißwurst. The beer garden rotates between Munich’s big breweries, and little fountains honour local folk comedians like Karl Valentin and Liesl Karlstadt. An apple-and-pretzel mosaic is basically the market’s menu in pixels.',
   },
@@ -161,7 +194,8 @@ const ARTWORKS = [
     lng: 11.5562,
     district: 'Sendling',
     category: 'pixel',
-    hint: 'Find the ship that is parked on a railway bridge. Yes, really.',
+    hint: 'Look for the old lake steamer sitting on a railway bridge in the Schlachthof quarter.',
+    closer: 'Head down Lagerhausstraße toward the ship on the bridge. Check the bridge piers, the stairways up to the deck and the walls around the area underneath.',
     trivia: 'A retired Ammersee passenger ship sits high on an old railway bridge as a bar and culture venue.',
     lore: 'The MS Utting carried passengers across the Ammersee for decades. Instead of scrapping her, a crew of Munich culture makers hauled the ship across the city on a heavy-load transporter and craned her onto a disused railway bridge in the Schlachthof quarter. Today she is a deck bar, club and event space — and a pretzel mosaic on a bridge with a boat on top is about as Munich-surreal as it gets.',
   },
@@ -173,7 +207,8 @@ const ARTWORKS = [
     lng: 11.5585,
     district: 'Ludwigsvorstadt',
     category: 'pixel',
-    hint: 'Circle the square above the U3/U6 station, a short walk south of the Wiesn.',
+    hint: 'The square above the U3/U6 Goetheplatz station, a short walk south of the Oktoberfest grounds.',
+    closer: 'The pin is on the square itself. Circle it slowly and check the building corners and the walls near the U-Bahn exits, about 3 m up.',
     trivia: 'The square is named after Goethe and sits a few minutes from the Oktoberfest grounds.',
     lore: 'Ludwigsvorstadt grew outside the old city walls in the 19th century and still has the Theresienwiese — home of Oktoberfest — on its doorstep. A pellet-chomping arcade hero from 1980 hoisting a Maß mug is the perfect mash-up of retro gaming and the world’s biggest folk festival.',
   },
@@ -185,7 +220,8 @@ const ARTWORKS = [
     lng: 11.5332,
     district: 'Neuhausen',
     category: 'pixel',
-    hint: 'Search the busy square in the heart of Neuhausen, near the U1 entrance.',
+    hint: 'The busy central square of Neuhausen, with its own U1 station.',
+    closer: 'The pin is on the square. Check the corners of the buildings around it and the walls near the U-Bahn exits, above the shop fronts.',
     trivia: 'The square takes its name from the Red Cross hospital founded nearby.',
     lore: 'Neuhausen was its own village until Munich absorbed it in 1890. Its central square is named after the Rotkreuzklinikum, the Red Cross hospital in the neighbourhood. Today it is a buzzing local hub of cafés and ice-cream queues — a sneaky spot for a pixel plant to pop out of a pipe.',
   },
@@ -197,7 +233,8 @@ const ARTWORKS = [
     lng: 11.5642,
     district: 'Glockenbach',
     category: 'pixel',
-    hint: 'Stroll the street that runs past the Old Southern Cemetery toward Glockenbach.',
+    hint: 'The street running south from Sendlinger Tor along the Old Southern Cemetery (Alter Südfriedhof).',
+    closer: 'The pin is on the stretch beside the cemetery wall. Walk both sides of the street and check building corners at first-floor height, especially at the side-street junctions.',
     trivia: 'Glockenbachviertel is named after a stream once used by the city’s bell founders.',
     lore: 'The Glockenbach (“bell brook”) took its name from the bell foundries that once worked along its banks. The streams were later covered over, and the quarter became one of Munich’s most colourful nightlife areas and the heart of its LGBTQ+ scene. A rainbow alien could not have picked a better home.',
   },
@@ -209,7 +246,8 @@ const ARTWORKS = [
     lng: 11.5731,
     district: 'Maxvorstadt',
     category: 'pixel',
-    hint: 'Scan building corners between the university quarter and the Pinakotheken.',
+    hint: 'In the university and museum quarter, a few blocks north of the Alte Pinakothek.',
+    closer: 'The pin is on Theresienstraße between Barer Straße and Türkenstraße. Walk the block on both sides and check corners and the space above shop signs.',
     trivia: 'The street honours Princess Therese, whose 1810 wedding party became the first Oktoberfest.',
     lore: 'Maxvorstadt was Munich’s first planned expansion beyond the old walls, laid out around 1800 under King Max I Joseph. Today it is the city’s brainy, arty quarter: the Alte and Neue Pinakothek, Pinakothek der Moderne and Museum Brandhorst sit a few blocks away, surrounded by thousands of students. A giant pixel creature fits right in among the museums.',
   },
@@ -221,7 +259,8 @@ const ARTWORKS = [
     lng: 11.5778,
     district: 'Maxvorstadt',
     category: 'pixel',
-    hint: 'Look up between the student cafés and bookshops near LMU.',
+    hint: 'A student street of cafés and bookshops just west of the LMU main building.',
+    closer: 'The pin is on Schellingstraße between Türkenstraße and Amalienstraße. This one is small, so scan every corner on both sides, from door height up to the first-floor windows.',
     trivia: 'The Schelling-Salon, a billiards café on this street, has been open since 1872.',
     lore: 'The street is named after philosopher Friedrich Wilhelm Joseph Schelling. Its old-school Schelling-Salon has served coffee, beer and billiards to generations of students, writers and artists. Tiny invaders love student streets: small, easy to miss, and spotted only by people who look up from their phones.',
   },
@@ -233,7 +272,8 @@ const ARTWORKS = [
     lng: 11.5692,
     district: 'Maxvorstadt',
     category: 'pixel',
-    hint: 'Walk the street linking Maxvorstadt’s museums and check wall corners above eye level.',
+    hint: 'Right next to the Alte Pinakothek museum, near Barer Straße.',
+    closer: 'The pin is on Gabelsbergerstraße close to the Barer Straße junction. Check the building corners around the junction and along the block facing the museum lawn.',
     trivia: 'Named after Franz Xaver Gabelsberger, inventor of a popular German shorthand system.',
     lore: 'Gabelsberger (1789–1849) created a shorthand that was used in parliaments and offices across the German-speaking world for decades. His street runs through the museum quarter — so this big blue alien is effectively making its own gallery debut, no ticket required.',
   },
@@ -245,7 +285,8 @@ const ARTWORKS = [
     lng: 11.5895,
     district: 'Au-Haidhausen',
     category: 'pixel',
-    hint: 'Head to the Isar bank beside the Ludwigsbrücke and the Art Nouveau bathhouse.',
+    hint: 'The Art Nouveau bathhouse on the east bank of the Isar, beside the Ludwigsbrücke.',
+    closer: 'Walk around the bathhouse building on Rosenheimer Straße and along the riverside path behind it. Check the corners of the building and the walls near the bridge.',
     trivia: 'This Art Nouveau bathhouse opened in 1901 as a public bath for the people of Munich.',
     lore: 'Engineer Karl Müller funded the bath so that ordinary residents — many without a bathroom at home — could wash and swim. More than a century later its vaulted halls, stucco and copper domes are still in use. Perched right on the Isar, it is the natural habitat of a river-loving alien.',
   },
@@ -257,7 +298,8 @@ const ARTWORKS = [
     lng: 11.5034,
     district: 'Nymphenburg',
     category: 'pixel',
-    hint: 'Follow the long palace canal and check around the bridge crossing.',
+    hint: 'At the palace end of the long Nymphenburg canal (tram 17, stop Schloss Nymphenburg).',
+    closer: 'The pin is where the canal meets the palace grounds. Check the bridges over the canal, their railings and the walls around the front courtyard.',
     trivia: 'In cold winters the palace canal freezes and locals play Eisstockschießen on the ice.',
     lore: 'Schloss Nymphenburg was begun in 1664 as a summer residence, a gift celebrating the birth of the heir Max Emanuel. The long canal reaches from the palace toward the city, framed by avenues of trees. A golden alien echoes the gilded Baroque rooms inside the palace.',
   },
@@ -269,7 +311,8 @@ const ARTWORKS = [
     lng: 11.536,
     district: 'Westend',
     category: 'pixel',
-    hint: 'Search the long road west of the Hackerbrücke, toward the Augustiner brewery.',
+    hint: 'The long road heading west from the Hackerbrücke, past the Augustiner brewery.',
+    closer: 'The pin is west of the Augustiner brewery, toward the Donnersbergerbrücke. Walk this stretch on both sides and check corners at the side-street junctions.',
     trivia: 'Augustiner — Munich’s oldest brewery, founded in 1328 — brews on this street.',
     lore: 'Westend (officially Schwanthalerhöhe) grew up as a working-class quarter of breweries, workshops and rail yards. It is now one of Munich’s most multicultural neighbourhoods, where old warehouse walls and courtyards make room for studios and street art.',
   },
@@ -283,7 +326,8 @@ const ARTWORKS = [
     lng: 11.606,
     district: 'Ostbahnhof',
     category: 'mural',
-    hint: 'Exit Ostbahnhof on the east side and look for the giant Ferris wheel.',
+    hint: 'The creative quarter on the east side of Ostbahnhof — follow the giant Ferris wheel.',
+    closer: 'Walk the lanes between the old factory halls around the Umadum wheel. The murals cover whole facades, so step back and look up at the walls.',
     trivia: 'Before its creative makeover, this site was the Pfanni potato-dumpling factory.',
     lore: 'When food maker Pfanni moved out, its warehouses became the party mile Kunstpark Ost, then the Kultfabrik. Today Werksviertel-Mitte mixes studios, concert halls, a rooftop sheep pasture and the Umadum Ferris wheel. Its walls are painted by big names in the scene — including Loomit, one of the pioneers of German graffiti since the 1980s.',
   },
@@ -295,7 +339,8 @@ const ARTWORKS = [
     lng: 11.554,
     district: 'Schlachthof',
     category: 'legal',
-    hint: 'Find the underpass near the old slaughterhouse grounds — follow the smell of spray paint.',
+    hint: 'Near the old slaughterhouse grounds in the Schlachthof quarter, a few minutes from Alte Utting.',
+    closer: 'Follow Tumblingerstraße to the pin and look for the long wall covered in fresh graffiti. On weekends you may see writers painting.',
     trivia: 'One of Munich’s few legal walls: painted over constantly, so it never looks the same twice.',
     lore: 'The Schlachthofviertel grew around the municipal slaughterhouse and cattle market, opened in 1878. Legal walls like this one give writers a place to practise without risk, turning the spot into a living Hall of Fame where pieces last days, not years. Visit twice and you will see two different galleries.',
   },
@@ -307,7 +352,8 @@ const ARTWORKS = [
     lng: 11.5702,
     district: 'Old Town',
     category: 'mural',
-    hint: 'Duck into a quiet lane just off the Sendlinger Straße shopping street.',
+    hint: 'A quiet lane in the old town, just off the Sendlinger Straße shopping street.',
+    closer: 'Find Hotterstraße and the Museum of Urban and Contemporary Art (MUCA). The museum’s own facade is the canvas — look at the whole building front.',
     trivia: 'MUCA opened in 2016 as Germany’s first museum dedicated to urban and contemporary art.',
     lore: 'Collectors Christian and Stephanie Utz turned a former electricity substation in the old town into the Museum of Urban and Contemporary Art. Inside you will find works by internationally known street artists; outside, the façade itself is a rotating canvas for large-scale pieces.',
   },
@@ -319,7 +365,8 @@ const ARTWORKS = [
     lng: 11.5788,
     district: 'Giesing',
     category: 'mural',
-    hint: 'Wander the streets of Giesing — she is watching over Zehentbauernstraße.',
+    hint: 'A residential street in Giesing, on the high bank east of the Isar.',
+    closer: 'Walk Zehentbauernstraße and look at the side and end walls of the apartment buildings. The portrait spans a large part of a wall.',
     trivia: 'Sophie Scholl of the White Rose resistance group was executed in 1943, aged 21.',
     lore: 'Sophie Scholl and her brother Hans, students at LMU, were arrested on 18 February 1943 after scattering anti-Nazi leaflets in the university’s atrium. They were executed four days later. The square outside the university’s main building now bears their name — Geschwister-Scholl-Platz — and murals like this keep her message of courage visible in everyday streets.',
   },
@@ -331,32 +378,44 @@ const ARTWORKS = [
     lng: 11.5877,
     district: 'Englischer Garten',
     category: 'mural',
-    hint: 'Follow the cheering to the bridge at the southern tip of the English Garden.',
+    hint: 'The river-surfing spot at the southern tip of the English Garden, next to the Haus der Kunst.',
+    closer: 'Stand on the Prinzregentenstraße bridge where people watch the surfers. Check the bridge walls and the passage on the park side.',
     trivia: 'Surfers have ridden a standing river wave here in the city centre for decades.',
     lore: 'The Eisbach is a man-made channel running through the Englischer Garten, one of the largest city parks in the world. Where it rushes out beside the Haus der Kunst, a standing wave forms — and surfers in wetsuits have been riding it for decades while crowds watch from the bridge. The graffiti here celebrates Munich’s unlikely surf culture.',
   },
 ];
 
 const ART_BY_ID = Object.fromEntries(ARTWORKS.map((a) => [a.id, a]));
-const MAX_POINTS = ARTWORKS.reduce((sum, a) => sum + CATEGORIES[a.category].points, 0);
+const MAX_POINTS = ARTWORKS.reduce((sum, a) => sum + CATEGORIES[a.category].points + BONUS_POINTS, 0);
 
 /* ========================================================================== */
 /* 3. UTILITIES                                                                */
 /* ========================================================================== */
 
+const toRad = (d) => (d * Math.PI) / 180;
+
 /** Great-circle distance in meters between two {lat,lng} points. */
 function distanceMeters(a, b) {
-  const R = 6371000;
-  const toRad = (d) => (d * Math.PI) / 180;
   const dLat = toRad(b.lat - a.lat);
   const dLng = toRad(b.lng - a.lng);
-  const h =
-    Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * 6371000 * Math.asin(Math.sqrt(h));
 }
 
+/** Compass bearing (0 = north, clockwise) from a to b. */
+function bearingDegrees(a, b) {
+  const y = Math.sin(toRad(b.lng - a.lng)) * Math.cos(toRad(b.lat));
+  const x =
+    Math.cos(toRad(a.lat)) * Math.sin(toRad(b.lat)) -
+    Math.sin(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.cos(toRad(b.lng - a.lng));
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+const COMPASS_POINTS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+const compassPoint = (deg) => COMPASS_POINTS[Math.round(deg / 45) % 8];
+
 function formatDistance(m) {
-  if (m < 1000) return `${Math.max(10, Math.round(m / 10) * 10)} m`;
+  if (m < 1000) return `${Math.max(5, Math.round(m / 5) * 5)} m`;
   return `${(m / 1000).toFixed(m < 10000 ? 1 : 0)} km`;
 }
 
@@ -368,36 +427,28 @@ function formatDate(ts) {
   }
 }
 
-/** Draws an image source to a canvas no larger than `max` px and returns a JPEG data URL. */
-function drawToDataUrl(source, srcW, srcH, max = 720) {
-  const scale = Math.min(1, max / Math.max(srcW, srcH));
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.round(srcW * scale);
-  canvas.height = Math.round(srcH * scale);
-  canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL('image/jpeg', 0.72);
+function shuffle(list) {
+  const a = [...list];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
-/** Reads a picked/captured photo and shrinks it so it fits comfortably in localStorage. */
-function downscaleImageFile(file) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      try {
-        resolve(drawToDataUrl(img, img.naturalWidth, img.naturalHeight));
-      } catch (e) {
-        reject(e);
-      } finally {
-        URL.revokeObjectURL(url);
-      }
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error('Unreadable image'));
-    };
-    img.src = url;
-  });
+/** Bonus question for an artwork: its custom `quiz`, or "which motif is this?" with 3 decoy motifs. */
+function buildQuiz(art) {
+  if (art.quiz?.question && art.quiz?.answer && art.quiz?.options?.length) {
+    return { question: art.quiz.question, answer: art.quiz.answer, options: shuffle(art.quiz.options) };
+  }
+  const sameCategory = shuffle(ARTWORKS.filter((a) => a.id !== art.id && a.category === art.category));
+  const others = shuffle(ARTWORKS.filter((a) => a.id !== art.id && a.category !== art.category));
+  const decoys = [...sameCategory, ...others].map((a) => a.motif).filter((m, i, all) => m !== art.motif && all.indexOf(m) === i);
+  return {
+    question: 'Bonus question: what does this artwork show? Look at it closely!',
+    answer: art.motif,
+    options: shuffle([art.motif, ...decoys.slice(0, 3)]),
+  };
 }
 
 /** Tiny deterministic PRNG so every artwork gets the same pixel sprite every time. */
@@ -414,6 +465,19 @@ function seededRandom(seed) {
 
 function rankFor(ratio) {
   return [...RANKS].reverse().find((r) => ratio >= r.min)?.title ?? RANKS[0].title;
+}
+
+/** Proximity tiers for the radar. */
+function proximity(distance, accuracy) {
+  if (distance <= CHECKIN_RADIUS_M) {
+    return accuracy <= MAX_GPS_ACCURACY_M
+      ? { label: 'You’re here!', color: C.mint }
+      : { label: 'Almost — waiting for a sharper GPS fix', color: C.butter };
+  }
+  if (distance <= 200) return { label: 'Burning hot', color: C.pink };
+  if (distance <= 500) return { label: 'Warm', color: C.butter };
+  if (distance <= 1500) return { label: 'Cool', color: C.sky };
+  return { label: 'Cold — use the map to get closer', color: C.lavender };
 }
 
 /* ========================================================================== */
@@ -437,7 +501,7 @@ function useSaveGame() {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(save));
     } catch {
-      // Storage full → keep progress, drop the photos.
+      // Storage full → drop photos kept from older versions, keep progress.
       try {
         const slim = {
           ...save,
@@ -490,13 +554,11 @@ function useSfx(enabled) {
         tone(523, { dur: 0.06 });
         tone(784, { at: 0.06, dur: 0.09 });
       },
-      shutter: () => {
-        tone(1400, { dur: 0.03, type: 'triangle', vol: 0.07 });
-        tone(380, { at: 0.04, dur: 0.07, type: 'triangle', vol: 0.06 });
-      },
-      scan: () => {
-        tone(180, { dur: 1.9, type: 'sawtooth', vol: 0.018, to: 960 });
-        [0.4, 0.8, 1.2, 1.6].forEach((at) => tone(1200, { at, dur: 0.04, vol: 0.02 }));
+      arrive: () => [784, 988, 1175].forEach((f, i) => tone(f, { at: i * 0.07, dur: 0.1, vol: 0.05 })),
+      checkIn: () => {
+        tone(392, { dur: 0.08 });
+        tone(523, { at: 0.08, dur: 0.08 });
+        tone(784, { at: 0.16, dur: 0.16, type: 'triangle' });
       },
       success: () => {
         [523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, { at: i * 0.08, dur: 0.14, vol: 0.05 }));
@@ -537,10 +599,96 @@ function useToast() {
   const show = useCallback((message, tone = 'info') => {
     clearTimeout(timer.current);
     setToast({ message, tone, id: Date.now() });
-    timer.current = setTimeout(() => setToast(null), 2800);
+    timer.current = setTimeout(() => setToast(null), 3000);
   }, []);
   useEffect(() => () => clearTimeout(timer.current), []);
   return [toast, show];
+}
+
+/**
+ * Live GPS while `active`. Reports positions through onPosition({lat,lng,acc,at}).
+ * status: 'idle' | 'searching' | 'ok' | 'denied' | 'unsupported'
+ */
+function useGpsWatch(active, onPosition) {
+  const [status, setStatus] = useState('idle');
+  const [attempt, setAttempt] = useState(0);
+  const cb = useRef(onPosition);
+  cb.current = onPosition;
+
+  useEffect(() => {
+    if (!active) return undefined;
+    if (typeof navigator === 'undefined' || !('geolocation' in navigator)) {
+      setStatus('unsupported');
+      return undefined;
+    }
+    setStatus('searching');
+    const id = navigator.geolocation.watchPosition(
+      (pos) => {
+        setStatus('ok');
+        cb.current({ lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy, at: Date.now() });
+      },
+      (err) => setStatus(err.code === 1 ? 'denied' : 'searching'),
+      { enableHighAccuracy: true, maximumAge: 3000, timeout: 20000 },
+    );
+    return () => navigator.geolocation.clearWatch(id);
+  }, [active, attempt]);
+
+  return { status, retry: () => setAttempt((n) => n + 1) };
+}
+
+/** Phone compass heading (0 = north). iOS asks for permission, so start() must run from a tap. */
+function useCompass() {
+  const [heading, setHeading] = useState(null);
+  const [state, setState] = useState('off'); // off | on | unavailable
+  const handler = useRef(null);
+
+  const stop = useCallback(() => {
+    if (!handler.current) return;
+    window.removeEventListener('deviceorientationabsolute', handler.current);
+    window.removeEventListener('deviceorientation', handler.current);
+    handler.current = null;
+  }, []);
+
+  const start = useCallback(async () => {
+    const DOE = typeof window !== 'undefined' ? window.DeviceOrientationEvent : undefined;
+    if (!DOE) {
+      setState('unavailable');
+      return;
+    }
+    try {
+      if (typeof DOE.requestPermission === 'function' && (await DOE.requestPermission()) !== 'granted') {
+        setState('unavailable');
+        return;
+      }
+    } catch {
+      setState('unavailable');
+      return;
+    }
+    stop();
+    handler.current = (e) => {
+      let h = null;
+      if (typeof e.webkitCompassHeading === 'number') h = e.webkitCompassHeading; // iOS
+      else if (e.absolute && typeof e.alpha === 'number') h = (360 - e.alpha) % 360; // Android
+      if (h == null) return;
+      setHeading((prev) => (prev == null || Math.abs(prev - h) > 2 ? Math.round(h) : prev));
+    };
+    const evt = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
+    window.addEventListener(evt, handler.current);
+    setState('on');
+  }, [stop]);
+
+  const toggle = () => {
+    if (state === 'on') {
+      stop();
+      setHeading(null);
+      setState('off');
+    } else {
+      start();
+    }
+  };
+
+  useEffect(() => stop, [stop]);
+  return { heading, state, toggle };
 }
 
 /* ========================================================================== */
@@ -592,12 +740,85 @@ function CategoryChip({ category, small = false }) {
 function StatusChip({ unlocked }) {
   return unlocked ? (
     <span className={`font-vt inline-flex items-center gap-1 ${PX_BORDER} bg-[#8ff0c8] px-1.5 py-1 text-[17px] leading-none text-[#141024]`}>
-      <Check size={13} strokeWidth={3} /> Unlocked
+      <Check size={13} strokeWidth={3} /> Found
     </span>
   ) : (
     <span className={`font-vt inline-flex items-center gap-1 ${PX_BORDER} bg-[#d9d3ee] px-1.5 py-1 text-[17px] leading-none text-[#141024]`}>
       <Lock size={12} strokeWidth={3} /> Locked
     </span>
+  );
+}
+
+/** Motif text, hidden behind "???" until the spot is found (it's the bonus-question answer). */
+function MotifLine({ art, revealed, className = '' }) {
+  return (
+    <p className={`font-vt text-[20px] leading-tight ${className}`}>
+      {revealed ? (
+        <>Motif: {art.motif}</>
+      ) : (
+        <>
+          Motif: <span className="tracking-widest">???</span>{' '}
+          <span className="text-[16px] opacity-75">(revealed on site)</span>
+        </>
+      )}
+    </p>
+  );
+}
+
+/**
+ * Three levels of help: area → where around the pin → what it looks like + exact pin.
+ * `dark` styles it for dark cards.
+ */
+function HintStack({ art, onShowExact, dark = false, sfx }) {
+  const [level, setLevel] = useState(1);
+  const cat = CATEGORIES[art.category];
+  const label = `font-vt mr-1 text-[17px] ${dark ? 'text-[#ffe08a]' : ''}`;
+  const text = `text-[13px] leading-snug ${dark ? 'text-[#e9e4fb]' : ''}`;
+
+  const more = () => {
+    sfx?.tap();
+    setLevel((l) => Math.min(3, l + 1));
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <p className={text}>
+        <span className={label}>🧭 WHERE</span>
+        {art.hint}
+      </p>
+      {level >= 2 && (
+        <p className={`mq-fade-in ${text}`}>
+          <span className={label}>🔍 CLOSER</span>
+          {art.closer}
+        </p>
+      )}
+      {level >= 3 && (
+        <p className={`mq-fade-in ${text}`}>
+          <span className={label}>👀 LOOK FOR</span>
+          {cat.lookFor}
+        </p>
+      )}
+      <div className="flex flex-wrap gap-2 pt-0.5">
+        {level < 3 && (
+          <button
+            type="button"
+            onClick={more}
+            className={`${PX_BTN} font-vt inline-flex items-center gap-1 bg-[#ffe08a] px-2 py-1 text-[16px] leading-none text-[#141024]`}
+          >
+            <Lightbulb size={13} strokeWidth={2.5} /> {level === 1 ? 'More help' : 'Even more help'}
+          </button>
+        )}
+        {level >= 3 && onShowExact && (
+          <button
+            type="button"
+            onClick={() => onShowExact(art.id)}
+            className={`${PX_BTN} font-vt inline-flex items-center gap-1 bg-[#9fd8ff] px-2 py-1 text-[16px] leading-none text-[#141024]`}
+          >
+            <Crosshair size={13} strokeWidth={2.5} /> Zoom to exact pin
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -699,7 +920,7 @@ function Header({ points, sound, onToggleSound }) {
 
 const TABS = [
   { id: 'map', emoji: '🗺️', label: 'Map', color: C.sky },
-  { id: 'scan', emoji: '📸', label: 'Scan Art', color: C.pink },
+  { id: 'checkin', emoji: '📍', label: 'Check In', color: C.pink },
   { id: 'collection', emoji: '🏅', label: 'Collection', color: C.butter },
 ];
 
@@ -712,7 +933,7 @@ function BottomNav({ tab, onChange, found }) {
       <div className="grid h-[68px] grid-cols-3">
         {TABS.map((t) => {
           const active = t.id === tab;
-          const isScan = t.id === 'scan';
+          const isCenter = t.id === 'checkin';
           return (
             <button
               key={t.id}
@@ -723,9 +944,9 @@ function BottomNav({ tab, onChange, found }) {
             >
               <span
                 className={`relative grid place-items-center ${PX_BORDER} transition-transform duration-100 ${
-                  isScan ? '-mt-6 h-14 w-14 text-[26px]' : 'h-9 w-11 text-[19px]'
+                  isCenter ? '-mt-6 h-14 w-14 text-[26px]' : 'h-9 w-11 text-[19px]'
                 } ${active ? `${PX_SHADOW} -translate-y-0.5` : 'shadow-none'}`}
-                style={{ background: active || isScan ? t.color : C.plumLight }}
+                style={{ background: active || isCenter ? t.color : C.plumLight }}
               >
                 <span aria-hidden="true">{t.emoji}</span>
                 {t.id === 'collection' && (
@@ -734,9 +955,7 @@ function BottomNav({ tab, onChange, found }) {
                   </span>
                 )}
               </span>
-              <span
-                className={`font-pixel text-[7.5px] leading-none ${active ? 'text-[#fff7fb]' : 'text-[#a99fcf]'}`}
-              >
+              <span className={`font-pixel text-[7.5px] leading-none ${active ? 'text-[#fff7fb]' : 'text-[#a99fcf]'}`}>
                 {t.label}
               </span>
               {active && <span className="absolute bottom-1 h-[3px] w-6" style={{ background: t.color }} />}
@@ -771,13 +990,13 @@ const SKETCH = {
     [48.1395, 11.5835], [48.1425, 11.58], [48.144, 11.5745], [48.1425, 11.569], [48.1392, 11.5655],
   ],
   roads: [
-    [[48.1425, 11.5775], [48.15, 11.58], [48.165, 11.5855], [48.18, 11.59]], // Ludwig-/Leopoldstraße
-    [[48.1415, 11.563], [48.148, 11.548], [48.1528, 11.5332], [48.1575, 11.5135]], // Nymphenburger Str.
-    [[48.134, 11.5676], [48.1275, 11.556], [48.12, 11.54]], // Lindwurmstraße
-    [[48.133, 11.5885], [48.129, 11.6], [48.1273, 11.6045]], // Rosenheimer Str.
-    [[48.1395, 11.5835], [48.1385, 11.595], [48.1375, 11.605]], // Maximilianstraße
-    [[48.1318, 11.573], [48.1235, 11.576], [48.112, 11.5785]], // Fraunhofer → Giesing
-    [[48.14, 11.556], [48.1408, 11.536], [48.1425, 11.515]], // Landsberger Str.
+    [[48.1425, 11.5775], [48.15, 11.58], [48.165, 11.5855], [48.18, 11.59]],
+    [[48.1415, 11.563], [48.148, 11.548], [48.1528, 11.5332], [48.1575, 11.5135]],
+    [[48.134, 11.5676], [48.1275, 11.556], [48.12, 11.54]],
+    [[48.133, 11.5885], [48.129, 11.6], [48.1273, 11.6045]],
+    [[48.1395, 11.5835], [48.1385, 11.595], [48.1375, 11.605]],
+    [[48.1318, 11.573], [48.1235, 11.576], [48.112, 11.5785]],
+    [[48.14, 11.556], [48.1408, 11.536], [48.1425, 11.515]],
   ],
   rail: [
     [[48.1402, 11.56], [48.1412, 11.545], [48.1432, 11.528], [48.1452, 11.505]],
@@ -863,7 +1082,7 @@ function FilterBar({ filter, onChange, counts }) {
   );
 }
 
-function ArtworkDrawer({ art, isUnlocked, userPos, onClose, onScan }) {
+function ArtworkDrawer({ art, isUnlocked, userPos, onClose, onCheckIn, onShowExact, sfx }) {
   const [dragY, setDragY] = useState(0);
   const [dragging, setDragging] = useState(false);
   const startY = useRef(null);
@@ -893,35 +1112,24 @@ function ArtworkDrawer({ art, isUnlocked, userPos, onClose, onScan }) {
       role="dialog"
       aria-label={`${art.name} details`}
     >
-      <div className={`mq-drawer-in mx-2 mb-2 ${PX_BORDER} bg-[#fff7fb] text-[#241f3a] shadow-[4px_4px_0_#141024]`}>
-        {/* Drag handle */}
-        <div
-          className="flex touch-none justify-center pb-1 pt-2"
-          onTouchStart={onTouchStart}
-          onTouchMove={onTouchMove}
-          onTouchEnd={onTouchEnd}
-        >
+      <div className={`mq-drawer-in mx-2 mb-2 flex max-h-[calc(100dvh-210px)] flex-col ${PX_BORDER} bg-[#fff7fb] text-[#241f3a] shadow-[4px_4px_0_#141024]`}>
+        <div className="flex shrink-0 touch-none justify-center pb-1 pt-2" onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
           <span className="h-[5px] w-12 bg-[#141024]/25" />
         </div>
 
-        <div className="px-4 pb-4">
+        <div className="min-h-0 overflow-y-auto px-4 pb-4">
           <div className="flex items-start gap-2">
             <div className="flex flex-1 flex-wrap gap-1.5">
               <CategoryChip category={art.category} small />
               <StatusChip unlocked={isUnlocked} />
             </div>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close"
-              className={`${PX_BTN} grid h-8 w-8 shrink-0 place-items-center bg-[#fff7fb]`}
-            >
+            <button type="button" onClick={onClose} aria-label="Close" className={`${PX_BTN} grid h-8 w-8 shrink-0 place-items-center bg-[#fff7fb]`}>
               <X size={16} strokeWidth={3} />
             </button>
           </div>
 
           <h2 className="font-pixel mt-3 text-[13px] leading-[1.5]">{art.name}</h2>
-          <p className="font-vt mt-1 text-[20px] leading-tight text-[#5b4f8a]">Motif: {art.motif}</p>
+          <MotifLine art={art} revealed={isUnlocked} className="mt-1 text-[#5b4f8a]" />
 
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] font-bold text-[#5b4f8a]">
             <span className="inline-flex items-center gap-1">
@@ -933,34 +1141,37 @@ function ArtworkDrawer({ art, isUnlocked, userPos, onClose, onScan }) {
               </span>
             )}
             <span className="inline-flex items-center gap-1">
-              <Sparkles size={14} strokeWidth={2.5} /> {cat.points} pts
+              <Sparkles size={14} strokeWidth={2.5} /> {cat.points} + {BONUS_POINTS} bonus
             </span>
           </div>
 
-          <div className={`mt-3 border-[3px] border-dashed border-[#141024]/30 p-2.5`} style={{ background: cat.tint }}>
-            {!isUnlocked && (
-              <p className="text-[13px] font-bold leading-snug">
-                <span className="font-vt mr-1 text-[17px]">🧭 HINT</span>
-                {art.hint}
+          <div className="mt-3 border-[3px] border-dashed border-[#141024]/30 p-2.5" style={{ background: cat.tint }}>
+            {isUnlocked ? (
+              <p className="text-[13px] leading-snug">
+                <span className="font-vt mr-1 text-[17px]">💡 LORE</span>
+                {art.trivia}
               </p>
+            ) : (
+              <HintStack key={art.id} art={art} onShowExact={onShowExact} sfx={sfx} />
             )}
-            <p className={`text-[13px] leading-snug ${!isUnlocked ? 'mt-1.5' : ''}`}>
-              <span className="font-vt mr-1 text-[17px]">
-                <Lightbulb size={13} strokeWidth={3} className="mr-0.5 inline -translate-y-px" />
-                LORE
-              </span>
-              {art.trivia}
-            </p>
           </div>
 
           <div className="mt-3 flex gap-2">
             <button
               type="button"
-              onClick={() => onScan(art.id)}
-              className={`${PX_BTN} font-pixel flex flex-1 items-center justify-center gap-2 bg-[#ff9ecf] px-3 py-3 text-[10px] leading-none text-[#141024]`}
+              onClick={() => onCheckIn(art.id)}
+              disabled={isUnlocked}
+              className={`${PX_BTN} font-pixel flex flex-1 items-center justify-center gap-2 bg-[#ff9ecf] px-3 py-3 text-[10px] leading-none text-[#141024] disabled:bg-[#d9d3ee]`}
             >
-              <Camera size={16} strokeWidth={2.5} />
-              {isUnlocked ? 'Rescan Spot' : 'Scan This Spot'}
+              {isUnlocked ? (
+                <>
+                  <Check size={16} strokeWidth={3} /> Collected
+                </>
+              ) : (
+                <>
+                  <span className="text-[14px]">📍</span> Go Check In
+                </>
+              )}
             </button>
             <a
               href={directionsUrl}
@@ -978,7 +1189,7 @@ function ArtworkDrawer({ art, isUnlocked, userPos, onClose, onScan }) {
   );
 }
 
-function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, userPos, onUserPos, onScan, toast, sfx }) {
+function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, focusRequest, userPos, onUserPos, onCheckIn, toast, sfx }) {
   const elRef = useRef(null);
   const mapRef = useRef(null);
   const pinLayerRef = useRef(null);
@@ -1001,7 +1212,7 @@ function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, use
       center: MUNICH_CENTER,
       zoom: 13,
       minZoom: sketch ? 11 : 3,
-      maxZoom: sketch ? 18 : 20,
+      maxZoom: sketch ? 19 : 20,
       maxBounds: sketch ? [[48.0, 11.35], [48.27, 11.8]] : undefined,
       zoomControl: false,
       attributionControl: false,
@@ -1031,19 +1242,31 @@ function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, use
     return () => clearTimeout(t);
   }, [active]);
 
-  // (Re)draw artwork pins whenever filter / progress / selection changes.
+  // (Re)draw artwork pins + the check-in circle of the selected spot.
   useEffect(() => {
     const layer = pinLayerRef.current;
     if (!layer) return;
     layer.clearLayers();
+    const selected = selectedId && ART_BY_ID[selectedId];
+    if (selected && !unlocked[selected.id]) {
+      L.circle([selected.lat, selected.lng], {
+        radius: CHECKIN_RADIUS_M,
+        color: C.pink,
+        weight: 2,
+        dashArray: '4 6',
+        fillColor: C.pink,
+        fillOpacity: 0.08,
+        interactive: false,
+      }).addTo(layer);
+    }
     ARTWORKS.filter((a) => filter === 'all' || a.category === filter).forEach((a) => {
-      const selected = a.id === selectedId;
+      const isSel = a.id === selectedId;
       const marker = L.marker([a.lat, a.lng], {
-        icon: makePinIcon(a, Boolean(unlocked[a.id]), selected),
+        icon: makePinIcon(a, Boolean(unlocked[a.id]), isSel),
         title: a.name,
         keyboard: true,
         bubblingMouseEvents: false,
-        zIndexOffset: selected ? 1000 : unlocked[a.id] ? 0 : 100,
+        zIndexOffset: isSel ? 1000 : unlocked[a.id] ? 0 : 100,
       });
       marker.on('click', () => onSelectRef.current(a.id));
       layer.addLayer(marker);
@@ -1064,15 +1287,16 @@ function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, use
     else map.flyToBounds(pts, { padding: [56, 72], maxZoom: 15, duration: 0.6 });
   }, [filter]);
 
-  // Fly to the selected pin, nudged up so the drawer doesn't cover it.
+  // Fly to the selected pin (or zoom right in on "exact pin" requests), nudged above the drawer.
   useEffect(() => {
     const map = mapRef.current;
     const art = selectedId && ART_BY_ID[selectedId];
     if (!map || !art || !active) return;
-    const zoom = Math.max(map.getZoom(), 15);
-    const pt = map.project([art.lat, art.lng], zoom).add([0, 130]);
+    const exact = focusRequest?.id === selectedId;
+    const zoom = exact ? 18 : Math.max(map.getZoom(), 15);
+    const pt = map.project([art.lat, art.lng], zoom).add([0, 150]);
     map.flyTo(map.unproject(pt, zoom), zoom, { duration: 0.6 });
-  }, [selectedId, active]);
+  }, [selectedId, active, focusRequest]);
 
   // User position marker + accuracy halo.
   useEffect(() => {
@@ -1101,7 +1325,7 @@ function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, use
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         setLocating(false);
-        const p = { lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy };
+        const p = { lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy, at: Date.now() };
         onUserPos(p);
         const fromCenter = distanceMeters(p, { lat: MUNICH_CENTER[0], lng: MUNICH_CENTER[1] });
         if (fromCenter > OUTSIDE_MUNICH_METERS) {
@@ -1115,10 +1339,7 @@ function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, use
       (err) => {
         setLocating(false);
         sfx.error();
-        toast(
-          err.code === 1 ? RUNTIME.gpsBlockedMessage || 'Location is blocked — allow it in your browser settings' : 'Couldn’t get your location',
-          'error',
-        );
+        toast(err.code === 1 ? RUNTIME.gpsBlockedMessage || 'Location is blocked — allow it in your browser settings' : 'Couldn’t get your location', 'error');
       },
       { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 },
     );
@@ -1140,18 +1361,11 @@ function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, use
 
       {!selected && (
         <>
-          <div
-            className={`font-vt pointer-events-none absolute bottom-7 left-3 z-[1000] ${PX_BORDER} ${PX_SHADOW} bg-[#2a2448] px-2 py-1 text-[17px] leading-none text-[#fff7fb]`}
-          >
+          <div className={`font-vt pointer-events-none absolute bottom-7 left-3 z-[1000] ${PX_BORDER} ${PX_SHADOW} bg-[#2a2448] px-2 py-1 text-[17px] leading-none text-[#fff7fb]`}>
             🏅 {found}/{ARTWORKS.length} found
           </div>
           <div className="absolute bottom-7 right-3 z-[1000] flex flex-col gap-2">
-            <button
-              type="button"
-              onClick={recenter}
-              aria-label="Center on Munich"
-              className={`${PX_BTN} grid h-11 w-11 place-items-center bg-[#fff7fb] text-[#141024]`}
-            >
+            <button type="button" onClick={recenter} aria-label="Center on Munich" className={`${PX_BTN} grid h-11 w-11 place-items-center bg-[#fff7fb] text-[#141024]`}>
               <Crosshair size={20} strokeWidth={2.5} />
             </button>
             <button
@@ -1174,7 +1388,9 @@ function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, use
           isUnlocked={Boolean(unlocked[selected.id])}
           userPos={userPos}
           onClose={() => onSelect(null)}
-          onScan={onScan}
+          onCheckIn={onCheckIn}
+          onShowExact={(id) => onSelect(id, { exact: true })}
+          sfx={sfx}
         />
       )}
     </div>
@@ -1182,180 +1398,82 @@ function MapView({ active, unlocked, filter, onFilter, selectedId, onSelect, use
 }
 
 /* ========================================================================== */
-/* 8. TAB 2 — SCAN                                                             */
+/* 8. TAB 2 — CHECK IN                                                         */
 /* ========================================================================== */
 
-function ViewfinderFrame({ target, live }) {
+function Radar({ bearing, heading, color, inRange }) {
+  const rotation = bearing == null ? 0 : bearing - (heading ?? 0);
+  const northRotation = -(heading ?? 0);
   return (
-    <div className="pointer-events-none absolute inset-0" aria-hidden="true">
-      {/* pixel corner brackets */}
-      {['left-3 top-3', 'right-3 top-3 rotate-90', 'bottom-3 right-3 rotate-180', 'bottom-3 left-3 -rotate-90'].map(
-        (pos) => (
-          <svg key={pos} viewBox="0 0 8 8" shapeRendering="crispEdges" className={`absolute h-9 w-9 ${pos}`}>
-            <path d="M0 0h8v2H2v6H0z" fill={C.pink} />
+    <div className="relative mx-auto aspect-square w-full max-w-[220px]" aria-hidden="true">
+      <svg viewBox="0 0 100 100" className="absolute inset-0 h-full w-full" shapeRendering="crispEdges">
+        <rect x="2" y="2" width="96" height="96" fill="#141024" />
+        {[44, 30, 16].map((r) => (
+          <circle key={r} cx="50" cy="50" r={r} fill="none" stroke={C.plumLight} strokeWidth="1.5" strokeDasharray="3 3" />
+        ))}
+        <line x1="50" y1="4" x2="50" y2="96" stroke={C.plumLight} strokeWidth="0.8" />
+        <line x1="4" y1="50" x2="96" y2="50" stroke={C.plumLight} strokeWidth="0.8" />
+      </svg>
+      {/* north marker rotates with the phone when the compass is on */}
+      <div className="absolute inset-0 transition-transform duration-300" style={{ transform: `rotate(${northRotation}deg)` }}>
+        <span className="font-pixel absolute left-1/2 top-[3%] -translate-x-1/2 text-[9px] text-[#ff9ecf]">N</span>
+      </div>
+      {bearing != null && (
+        <div className="absolute inset-0 transition-transform duration-300" style={{ transform: `rotate(${rotation}deg)` }}>
+          <svg viewBox="0 0 16 16" shapeRendering="crispEdges" className={`absolute left-1/2 top-[14%] h-[42%] w-[42%] -translate-x-1/2 ${inRange ? 'mq-blink' : ''}`}>
+            <path d="M7 0h2v2h2v2h2v2h2v2H11v8H5V8H1V6h2V4h2V2h2z" fill={color} stroke="#141024" strokeWidth="0.6" />
           </svg>
-        ),
+        </div>
       )}
-      {/* crosshair (only over the live camera feed) */}
-      <div className={`absolute left-1/2 top-1/2 h-14 w-14 -translate-x-1/2 -translate-y-1/2 ${live ? '' : 'hidden'}`}>
-        <span className="absolute left-1/2 top-0 h-4 w-[3px] -translate-x-1/2 bg-[#fff7fb]/80" />
-        <span className="absolute bottom-0 left-1/2 h-4 w-[3px] -translate-x-1/2 bg-[#fff7fb]/80" />
-        <span className="absolute left-0 top-1/2 h-[3px] w-4 -translate-y-1/2 bg-[#fff7fb]/80" />
-        <span className="absolute right-0 top-1/2 h-[3px] w-4 -translate-y-1/2 bg-[#fff7fb]/80" />
-        <span className="absolute left-1/2 top-1/2 h-[6px] w-[6px] -translate-x-1/2 -translate-y-1/2 bg-[#ff9ecf]" />
-      </div>
-      {/* laser line */}
-      <div className="mq-laser absolute inset-x-4 h-[3px] bg-[#8ff0c8] shadow-[0_0_12px_3px_rgba(143,240,200,.7)]" />
-      {/* HUD */}
-      <div className="font-vt absolute left-4 top-12 flex items-center gap-1.5 text-[17px] leading-none text-[#8ff0c8]">
-        <span className="mq-blink inline-block h-2.5 w-2.5 bg-[#ff9ecf]" /> AI SCAN MODE
-      </div>
-      <div className="font-vt absolute right-4 top-12 text-right text-[17px] leading-none text-[#ffe08a]">
-        +{CATEGORIES[target.category].points} PTS
-      </div>
-      <div className="font-vt absolute inset-x-0 bottom-12 text-center text-[18px] leading-none text-[#fff7fb]/85">
-        Fit the artwork inside the frame
-      </div>
+      <span className="absolute left-1/2 top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 border-2 border-[#141024] bg-[#9fd8ff]" />
     </div>
   );
 }
 
-function AnalyzingOverlay({ shot }) {
-  const [step, setStep] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setStep((s) => (s + 1) % SCAN_STEPS.length), SCAN_DURATION_MS / SCAN_STEPS.length);
-    return () => clearInterval(id);
-  }, []);
-
-  return (
-    <div className="absolute inset-0 z-20" role="status" aria-live="polite">
-      {shot && <img src={shot} alt="" className="absolute inset-0 h-full w-full object-cover" />}
-      <div className="mq-scanlines absolute inset-0 bg-[#141024]/70" />
-      <div className="mq-laser absolute inset-x-0 h-[3px] bg-[#ff9ecf] shadow-[0_0_14px_4px_rgba(255,158,207,.8)]" />
-      <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 px-6 text-center">
-        <div className="mq-loader" aria-hidden="true">
-          {Array.from({ length: 8 }, (_, i) => (
-            <span key={i} style={{ animationDelay: `${i * 0.1}s` }} />
-          ))}
-        </div>
-        <p className="font-pixel text-[11px] leading-[1.7] text-[#fff7fb]">
-          Analyzing Street Art
-          <br />
-          with AI…
-        </p>
-        <p className="font-vt h-5 text-[19px] leading-none text-[#8ff0c8]">{SCAN_STEPS[step]}</p>
-        <div className={`h-4 w-48 ${PX_BORDER} bg-[#2a2448]`}>
-          <div className="mq-fill h-full bg-[#ffe08a]" style={{ animationDuration: `${SCAN_DURATION_MS}ms` }} />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ScanView({ unlocked, targetId, onTarget, onVerified, sfx, toast }) {
-  const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const cameraInputRef = useRef(null);
-  const galleryInputRef = useRef(null);
-  const timerRef = useRef(null);
-  const [camState, setCamState] = useState(LIVE_CAMERA ? 'off' : 'unavailable'); // off | starting | live | unavailable
-  const [phase, setPhase] = useState('idle'); // idle | analyzing
-  const [shot, setShot] = useState(null);
-  const [flash, setFlash] = useState(false);
-
+function CheckInView({ unlocked, targetId, onTarget, userPos, onUserPos, onCheckIn, onShowExact, sfx }) {
   const target = ART_BY_ID[targetId];
   const cat = CATEGORIES[target.category];
   const isUnlocked = Boolean(unlocked[target.id]);
+  const { status, retry } = useGpsWatch(true, onUserPos);
+  const compass = useCompass();
 
-  const stopCamera = useCallback(() => {
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    if (videoRef.current) videoRef.current.srcObject = null;
-  }, []);
+  const fresh = userPos && Date.now() - (userPos.at || 0) < 2 * 60 * 1000;
+  const distance = fresh ? distanceMeters(userPos, target) : null;
+  const bearing = fresh ? bearingDegrees(userPos, target) : null;
+  const acc = fresh ? Math.round(userPos.acc || 999) : null;
+  const inRange = distance != null && distance <= CHECKIN_RADIUS_M && acc <= MAX_GPS_ACCURACY_M;
+  const prox = distance != null ? proximity(distance, acc) : null;
 
-  useEffect(
-    () => () => {
-      stopCamera();
-      clearTimeout(timerRef.current);
-    },
-    [stopCamera],
-  );
-
-  const startCamera = async () => {
-    sfx.tap();
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setCamState('unavailable');
-      toast('Live camera not supported here — tap Snap to use your phone camera', 'error');
-      return;
+  // Little fanfare the moment you walk into range.
+  const wasInRange = useRef(false);
+  useEffect(() => {
+    if (inRange && !wasInRange.current && !isUnlocked) {
+      sfx.arrive();
+      navigator.vibrate?.(60);
     }
-    setCamState('starting');
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } },
-        audio: false,
-      });
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play().catch(() => {});
-      }
-      setCamState('live');
-    } catch {
-      setCamState('unavailable');
-      sfx.error();
-      toast('Camera blocked — tap Snap or Upload instead', 'error');
-    }
-  };
+    wasInRange.current = inRange;
+  }, [inRange, isUnlocked, sfx]);
+  useEffect(() => {
+    wasInRange.current = false;
+  }, [targetId]);
 
-  const toggleCamera = () => {
-    if (camState === 'live') {
-      sfx.tap();
-      stopCamera();
-      setCamState('off');
-    } else {
-      startCamera();
-    }
-  };
+  let gpsLine;
+  if (status === 'denied') gpsLine = RUNTIME.gpsBlockedMessage || 'Location is blocked. Allow location for this site in your browser settings, then tap Retry.';
+  else if (status === 'unsupported') gpsLine = 'This device has no GPS access.';
+  else if (!fresh) gpsLine = 'Looking for your GPS position… Stand still in the open for a few seconds.';
+  else if (acc > MAX_GPS_ACCURACY_M) gpsLine = `GPS signal is vague (±${acc} m). Step away from tall buildings and wait a moment.`;
+  else gpsLine = `GPS accuracy ±${acc} m`;
 
-  const analyze = (dataUrl) => {
-    setShot(dataUrl);
-    setPhase('analyzing');
-    sfx.scan();
-    clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => {
-      setPhase('idle');
-      setShot(null);
-      onVerified(target.id, dataUrl);
-    }, SCAN_DURATION_MS);
-  };
-
-  const snap = () => {
-    if (phase !== 'idle') return;
-    sfx.shutter();
-    const video = videoRef.current;
-    if (camState === 'live' && video?.videoWidth) {
-      setFlash(true);
-      setTimeout(() => setFlash(false), 180);
-      analyze(drawToDataUrl(video, video.videoWidth, video.videoHeight));
-    } else {
-      cameraInputRef.current?.click(); // opens the native camera on phones
-    }
-  };
-
-  const onFile = async (e) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
-    try {
-      analyze(await downscaleImageFile(file));
-    } catch {
-      sfx.error();
-      toast('Couldn’t read that photo — try another one', 'error');
-    }
-  };
+  const checkInLabel = isUnlocked
+    ? 'Already collected'
+    : inRange
+      ? `Check In  +${cat.points}`
+      : distance != null
+        ? `Get within ${CHECKIN_RADIUS_M} m to check in`
+        : 'Waiting for GPS…';
 
   return (
-    <div className="mq-grid-bg absolute inset-0 flex flex-col gap-3 overflow-y-auto p-3">
+    <div className="mq-grid-bg absolute inset-0 flex flex-col gap-3 overflow-y-auto p-3 pb-6">
       {/* Target picker */}
       <div className={`shrink-0 ${PX_BORDER} ${PX_SHADOW} bg-[#fff7fb] p-2.5 text-[#241f3a]`}>
         <div className="flex items-center gap-2.5">
@@ -1364,13 +1482,12 @@ function ScanView({ unlocked, targetId, onTarget, onVerified, sfx, toast }) {
           </div>
           <div className="min-w-0 flex-1">
             <label htmlFor="mq-target" className="font-vt block text-[16px] leading-none text-[#7a6fae]">
-              SCAN TARGET {isUnlocked ? '· ✓ COLLECTED' : ''}
+              TARGET {isUnlocked ? '· ✓ COLLECTED' : `· ${cat.points} PTS + ${BONUS_POINTS} BONUS`}
             </label>
             <div className="relative mt-1">
               <select
                 id="mq-target"
                 value={target.id}
-                disabled={phase !== 'idle'}
                 onChange={(e) => (sfx.tap(), onTarget(e.target.value))}
                 className="font-pixel w-full appearance-none truncate bg-transparent pr-6 text-[10.5px] leading-[1.4] text-[#141024] outline-none"
               >
@@ -1380,6 +1497,7 @@ function ScanView({ unlocked, targetId, onTarget, onVerified, sfx, toast }) {
                       <option key={a.id} value={a.id}>
                         {unlocked[a.id] ? '✓ ' : ''}
                         {a.name}
+                        {userPos ? ` · ${formatDistance(distanceMeters(userPos, a))}` : ''}
                       </option>
                     ))}
                   </optgroup>
@@ -1387,95 +1505,87 @@ function ScanView({ unlocked, targetId, onTarget, onVerified, sfx, toast }) {
               </select>
               <ChevronDown size={16} strokeWidth={3} className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2" />
             </div>
-            <p className="mt-1 truncate text-[12px] font-bold text-[#7a6fae]">
-              {target.motif} · {target.district}
-            </p>
+            <p className="mt-1 truncate text-[12px] font-bold text-[#7a6fae]">{target.district}</p>
           </div>
         </div>
       </div>
 
-      {/* Viewfinder */}
-      <div className={`relative min-h-[260px] flex-1 overflow-hidden ${PX_BORDER} bg-[#0d0a1a] shadow-[4px_4px_0_#141024]`}>
-        <video
-          ref={videoRef}
-          playsInline
-          muted
-          className={`absolute inset-0 h-full w-full object-cover ${camState === 'live' ? '' : 'hidden'}`}
-        />
+      {/* Radar */}
+      <section className={`shrink-0 ${PX_BORDER} shadow-[4px_4px_0_#141024] bg-[#2a2448] p-3`} aria-label="Distance and direction to target">
+        <Radar bearing={bearing} heading={compass.heading} color={prox?.color || C.lavender} inRange={inRange} />
 
-        {camState !== 'live' && (
-          <div className="mq-scanlines absolute inset-0 grid place-items-center bg-[radial-gradient(circle_at_50%_40%,#3a3363,#141024_70%)] px-6 text-center">
-            <div className="flex flex-col items-center gap-3">
-              <ScanLine size={40} strokeWidth={2} className="text-[#b9a3ff]" />
-              <p className="font-vt whitespace-pre-line text-[20px] leading-tight text-[#d9d3ee]">
-                {camState === 'starting'
-                  ? 'Booting camera…'
-                  : camState === 'unavailable'
-                    ? LIVE_CAMERA
-                      ? 'Live preview unavailable here.\nSnap opens your phone camera.'
-                      : 'Snap opens your phone camera.\nUpload picks a saved photo.'
-                    : 'Point at the artwork, then Snap.'}
-              </p>
-              {camState === 'off' && (
-                <button
-                  type="button"
-                  onClick={startCamera}
-                  className={`${PX_BTN} font-pixel flex items-center gap-2 bg-[#b9a3ff] px-3 py-2.5 text-[9px] leading-none text-[#141024]`}
-                >
-                  <Video size={14} strokeWidth={2.5} /> Start live view
-                </button>
-              )}
-            </div>
-          </div>
-        )}
+        <div className="mt-3 text-center">
+          <p className="font-pixel text-[20px] leading-none text-[#fff7fb]">{distance != null ? formatDistance(distance) : '— m'}</p>
+          {bearing != null && (
+            <p className="font-vt mt-1.5 text-[18px] leading-none text-[#d9d3ee]">
+              {compass.heading != null ? 'Follow the arrow' : `Head ${compassPoint(bearing)} (arrow: north is up)`}
+            </p>
+          )}
+          {prox && (
+            <p
+              className={`font-vt mx-auto mt-2 inline-block ${PX_BORDER} px-2 py-1 text-[18px] leading-none text-[#141024]`}
+              style={{ background: prox.color }}
+              aria-live="polite"
+            >
+              {prox.label}
+            </p>
+          )}
+          <p className="mt-2 text-[12px] font-bold leading-snug text-[#a99fcf]">{gpsLine}</p>
+        </div>
 
-        {phase === 'idle' && <ViewfinderFrame target={target} live={camState === 'live'} />}
-        {phase === 'analyzing' && <AnalyzingOverlay shot={shot} />}
-        {flash && <div className="absolute inset-0 z-30 bg-white" />}
-      </div>
-
-      {/* Controls */}
-      <div className="flex shrink-0 items-center justify-between gap-3 px-1 pb-1">
-        <button
-          type="button"
-          onClick={() => (sfx.tap(), galleryInputRef.current?.click())}
-          disabled={phase !== 'idle'}
-          className={`${PX_BTN} font-vt flex h-12 w-[84px] flex-col items-center justify-center bg-[#fff7fb] text-[16px] leading-none text-[#141024] disabled:opacity-50`}
-        >
-          <ImagePlus size={18} strokeWidth={2.5} />
-          Upload
-        </button>
-
-        <button
-          type="button"
-          onClick={snap}
-          disabled={phase !== 'idle'}
-          aria-label="Take photo and verify"
-          className={`${PX_BTN} grid h-[70px] w-[70px] place-items-center bg-[#ff9ecf] text-[#141024] disabled:opacity-60`}
-        >
-          <span className={`grid h-[50px] w-[50px] place-items-center ${PX_BORDER} bg-[#fff7fb]`}>
-            <Camera size={24} strokeWidth={2.5} />
-          </span>
-        </button>
-
-        {LIVE_CAMERA ? (
+        <div className="mt-3 flex flex-wrap justify-center gap-2">
           <button
             type="button"
-            onClick={toggleCamera}
-            disabled={phase !== 'idle' || camState === 'starting'}
-            className={`${PX_BTN} font-vt flex h-12 w-[84px] flex-col items-center justify-center text-[16px] leading-none text-[#141024] disabled:opacity-50`}
-            style={{ background: camState === 'live' ? C.mint : C.lavender }}
+            onClick={() => (sfx.tap(), compass.toggle())}
+            disabled={compass.state === 'unavailable'}
+            className={`${PX_BTN} font-vt inline-flex items-center gap-1.5 px-2.5 py-1 text-[16px] leading-none text-[#141024] disabled:opacity-50`}
+            style={{ background: compass.state === 'on' ? C.mint : C.cream }}
           >
-            {camState === 'live' ? <VideoOff size={18} strokeWidth={2.5} /> : <Video size={18} strokeWidth={2.5} />}
-            {camState === 'live' ? 'Stop' : 'Live'}
+            <Compass size={14} strokeWidth={2.5} />
+            {compass.state === 'on' ? 'Compass on' : compass.state === 'unavailable' ? 'No compass' : 'Use compass'}
           </button>
-        ) : (
-          <span className="w-[84px]" aria-hidden="true" />
-        )}
-      </div>
+          {(status === 'denied' || status === 'unsupported') && (
+            <button type="button" onClick={retry} className={`${PX_BTN} font-vt inline-flex items-center gap-1.5 bg-[#ffe08a] px-2.5 py-1 text-[16px] leading-none text-[#141024]`}>
+              <RotateCcw size={14} strokeWidth={2.5} /> Retry GPS
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => onShowExact(target.id)}
+            className={`${PX_BTN} font-vt inline-flex items-center gap-1.5 bg-[#9fd8ff] px-2.5 py-1 text-[16px] leading-none text-[#141024]`}
+          >
+            <MapPin size={14} strokeWidth={2.5} /> See on map
+          </button>
+        </div>
+      </section>
 
-      <input ref={cameraInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={onFile} />
-      <input ref={galleryInputRef} type="file" accept="image/*" className="hidden" onChange={onFile} />
+      {/* Check-in */}
+      <button
+        type="button"
+        onClick={() => onCheckIn(target.id)}
+        disabled={!inRange || isUnlocked}
+        className={`${PX_BTN} font-pixel shrink-0 px-3 py-4 text-[11px] leading-none text-[#141024] disabled:shadow-none`}
+        style={{ background: inRange && !isUnlocked ? C.pink : '#d9d3ee' }}
+      >
+        📍 {checkInLabel}
+      </button>
+      {DEMO_CHECKIN && !isUnlocked && !inRange && (
+        <button
+          type="button"
+          onClick={() => onCheckIn(target.id, { demo: true })}
+          className="font-vt -mt-1 self-center text-[17px] text-[#a99fcf] underline decoration-2 underline-offset-2"
+        >
+          Demo only: pretend I’m there
+        </button>
+      )}
+
+      {/* Hints */}
+      {!isUnlocked && (
+        <section className={`shrink-0 ${PX_BORDER} ${PX_SHADOW} p-3 text-[#241f3a]`} style={{ background: cat.tint }}>
+          <MotifLine art={target} revealed={false} className="mb-2 text-[#5b4f8a]" />
+          <HintStack key={target.id} art={target} onShowExact={onShowExact} sfx={sfx} />
+        </section>
+      )}
     </div>
   );
 }
@@ -1484,7 +1594,7 @@ function ScanView({ unlocked, targetId, onTarget, onVerified, sfx, toast }) {
 /* 9. TAB 3 — COLLECTION & LORE                                                */
 /* ========================================================================== */
 
-function ArtworkCard({ art, entry, open, onToggle, onShowOnMap, onScan, innerRef }) {
+function ArtworkCard({ art, entry, open, onToggle, onShowOnMap, onShowExact, onCheckIn, innerRef, sfx }) {
   const cat = CATEGORIES[art.category];
 
   if (!entry) {
@@ -1505,19 +1615,18 @@ function ArtworkCard({ art, entry, open, onToggle, onShowOnMap, onScan, innerRef
             <p className="mt-0.5 flex items-center gap-1 text-[12px] font-bold text-[#a99fcf]">
               <MapPin size={12} strokeWidth={2.5} /> {art.district} · {cat.points} pts
             </p>
-            <p className="mt-1.5 text-[12.5px] leading-snug text-[#e9e4fb]">
-              <span className="font-vt mr-1 text-[16px] text-[#ffe08a]">🧭 HINT</span>
-              {art.hint}
-            </p>
+            <div className="mt-1.5">
+              <HintStack art={art} dark onShowExact={onShowExact} sfx={sfx} />
+            </div>
           </div>
         </div>
         <div className="mt-2.5 flex gap-2">
           <button
             type="button"
-            onClick={() => onScan(art.id)}
+            onClick={() => onCheckIn(art.id)}
             className={`${PX_BTN} font-vt flex flex-1 items-center justify-center gap-1.5 bg-[#ff9ecf] py-1.5 text-[17px] leading-none text-[#141024]`}
           >
-            <Camera size={14} strokeWidth={2.5} /> Scan
+            📍 Check in
           </button>
           <button
             type="button"
@@ -1545,15 +1654,16 @@ function ArtworkCard({ art, entry, open, onToggle, onShowOnMap, onScan, innerRef
         <span className={`font-vt absolute right-2 top-2 inline-flex items-center gap-1 ${PX_BORDER} bg-[#8ff0c8] px-1.5 py-0.5 text-[15px] leading-none text-[#141024]`}>
           <Check size={12} strokeWidth={3} /> FOUND
         </span>
-        <span className="font-vt absolute bottom-2 left-2 bg-[#141024]/80 px-1.5 py-0.5 text-[15px] leading-none text-[#fff7fb]">
-          {formatDate(entry.at)}
-        </span>
+        <span className="font-vt absolute bottom-2 left-2 bg-[#141024]/80 px-1.5 py-0.5 text-[15px] leading-none text-[#fff7fb]">{formatDate(entry.at)}</span>
+        {entry.bonus && (
+          <span className={`font-vt absolute bottom-2 right-2 ${PX_BORDER} bg-[#ffe08a] px-1.5 py-0.5 text-[15px] leading-none text-[#141024]`}>★ BONUS</span>
+        )}
       </div>
 
       <div className="p-3">
         <div className="flex items-start justify-between gap-2">
           <h3 className="font-pixel text-[11px] leading-[1.5]">{art.name}</h3>
-          <span className="font-vt shrink-0 bg-[#ffe08a] px-1.5 text-[16px] leading-[20px]">+{cat.points}</span>
+          <span className="font-vt shrink-0 bg-[#ffe08a] px-1.5 text-[16px] leading-[20px]">+{cat.points + (entry.bonus ? BONUS_POINTS : 0)}</span>
         </div>
         <p className="font-vt text-[19px] leading-tight text-[#5b4f8a]">{art.motif}</p>
         <p className="mt-0.5 flex items-center gap-1 text-[12px] font-bold text-[#7a6fae]">
@@ -1590,7 +1700,7 @@ function ArtworkCard({ art, entry, open, onToggle, onShowOnMap, onScan, innerRef
   );
 }
 
-function CollectionView({ unlocked, points, highlightId, onShowOnMap, onScan, onReset, sfx }) {
+function CollectionView({ unlocked, points, highlightId, onShowOnMap, onShowExact, onCheckIn, onReset, sfx }) {
   const [view, setView] = useState('all');
   const [openId, setOpenId] = useState(highlightId ?? null);
   const [confirmReset, setConfirmReset] = useState(false);
@@ -1610,7 +1720,6 @@ function CollectionView({ unlocked, points, highlightId, onShowOnMap, onScan, on
 
   return (
     <div className="mq-grid-bg absolute inset-0 overflow-y-auto overscroll-contain p-3 pb-8">
-      {/* Progress */}
       <section className={`${PX_BORDER} shadow-[4px_4px_0_#141024] bg-[#2a2448] p-3`}>
         <div className="flex items-center justify-between gap-2">
           <h2 className="font-pixel text-[11px] leading-none text-[#ffe0f0]">🏅 Collection &amp; Lore</h2>
@@ -1630,12 +1739,7 @@ function CollectionView({ unlocked, points, highlightId, onShowOnMap, onScan, on
           aria-label="Artworks discovered"
         >
           {ARTWORKS.map((a) => (
-            <span
-              key={a.id}
-              className="h-full flex-1 transition-colors"
-              style={{ background: unlocked[a.id] ? CATEGORIES[a.category].color : C.plumLight }}
-              title={a.name}
-            />
+            <span key={a.id} className="h-full flex-1 transition-colors" style={{ background: unlocked[a.id] ? CATEGORIES[a.category].color : C.plumLight }} title={a.name} />
           ))}
         </div>
 
@@ -1651,7 +1755,6 @@ function CollectionView({ unlocked, points, highlightId, onShowOnMap, onScan, on
         </div>
       </section>
 
-      {/* View switch */}
       <div className={`mt-4 grid grid-cols-3 ${PX_BORDER} ${PX_SHADOW} bg-[#2a2448]`} role="tablist">
         {[
           ['all', `All ${ARTWORKS.length}`],
@@ -1664,22 +1767,21 @@ function CollectionView({ unlocked, points, highlightId, onShowOnMap, onScan, on
             role="tab"
             aria-selected={view === id}
             onClick={() => (sfx.tap(), setView(id))}
-            className={`font-vt py-1.5 text-[18px] leading-none ${
-              view === id ? 'bg-[#ffe08a] text-[#141024]' : 'text-[#d9d3ee]'
-            } ${id !== 'locked' ? 'border-r-[3px] border-[#141024]' : ''}`}
+            className={`font-vt py-1.5 text-[18px] leading-none ${view === id ? 'bg-[#ffe08a] text-[#141024]' : 'text-[#d9d3ee]'} ${
+              id !== 'locked' ? 'border-r-[3px] border-[#141024]' : ''
+            }`}
           >
             {label}
           </button>
         ))}
       </div>
 
-      {/* Cards */}
       <div className="mt-4 space-y-4">
         {list.length === 0 && (
           <div className={`${PX_BORDER} border-dashed bg-[#2a2448]/60 p-6 text-center`}>
             <p className="text-[34px]">{view === 'found' ? '🔍' : '🎉'}</p>
             <p className="font-vt mt-2 text-[20px] leading-tight text-[#d9d3ee]">
-              {view === 'found' ? 'Nothing collected yet. Head to the map and scan your first artwork!' : 'Every artwork unlocked. You are a MUC Legend!'}
+              {view === 'found' ? 'Nothing collected yet. Pick a spot on the map and walk there to check in!' : 'Every artwork unlocked. You are a MUC Legend!'}
             </p>
           </div>
         )}
@@ -1691,13 +1793,14 @@ function CollectionView({ unlocked, points, highlightId, onShowOnMap, onScan, on
             open={openId === art.id}
             onToggle={() => (sfx.tap(), setOpenId((id) => (id === art.id ? null : art.id)))}
             onShowOnMap={onShowOnMap}
-            onScan={onScan}
+            onShowExact={onShowExact}
+            onCheckIn={onCheckIn}
             innerRef={(el) => (cardRefs.current[art.id] = el)}
+            sfx={sfx}
           />
         ))}
       </div>
 
-      {/* Reset */}
       {found > 0 && (
         <div className="mt-8 flex justify-center">
           {confirmReset ? (
@@ -1710,11 +1813,7 @@ function CollectionView({ unlocked, points, highlightId, onShowOnMap, onScan, on
               >
                 Yes, reset
               </button>
-              <button
-                type="button"
-                onClick={() => setConfirmReset(false)}
-                className={`${PX_BTN} font-vt bg-[#fff7fb] px-2.5 py-1 text-[17px] leading-none text-[#141024]`}
-              >
+              <button type="button" onClick={() => setConfirmReset(false)} className={`${PX_BTN} font-vt bg-[#fff7fb] px-2.5 py-1 text-[17px] leading-none text-[#141024]`}>
                 Cancel
               </button>
             </div>
@@ -1734,75 +1833,86 @@ function CollectionView({ unlocked, points, highlightId, onShowOnMap, onScan, on
 }
 
 /* ========================================================================== */
-/* 10. REWARD MODAL                                                            */
+/* 10. CHECK-IN MODAL (bonus quiz → reward)                                    */
 /* ========================================================================== */
 
-function RewardModal({ reward, onCollection, onKeepHunting }) {
-  const { art, photo, isNew, points, confidence } = reward;
+function CheckInModal({ session, onAnswer, onCollection, onKeepHunting }) {
+  const { art, quiz, picked } = session;
   const cat = CATEGORIES[art.category];
-  const closeRef = useRef(null);
-  useEffect(() => closeRef.current?.focus(), []);
+  const answered = picked != null;
+  const correct = answered && picked === quiz.answer;
+  const firstButton = useRef(null);
+  useEffect(() => firstButton.current?.focus(), [answered]);
 
   return (
-    <div className="absolute inset-0 z-[3000] flex items-center justify-center bg-[#0d0a1a]/80 p-4" role="dialog" aria-modal="true" aria-labelledby="mq-reward-title">
-      {isNew && <Confetti />}
+    <div className="absolute inset-0 z-[3000] flex items-center justify-center bg-[#0d0a1a]/80 p-4" role="dialog" aria-modal="true" aria-labelledby="mq-modal-title">
+      {answered && <Confetti count={correct ? 80 : 36} />}
       <div className={`mq-pop relative flex max-h-full w-full flex-col overflow-hidden ${PX_BORDER} shadow-[6px_6px_0_#141024] bg-[#fff7fb] text-[#241f3a]`}>
         <div className="font-pixel flex items-center justify-center gap-2 border-b-[3px] border-[#141024] py-2.5 text-[10px] leading-none" style={{ background: cat.color }}>
-          <span className="mq-blink">★</span> {isNew ? 'Artwork Verified' : 'Already Collected'} <span className="mq-blink">★</span>
+          <span className="mq-blink">★</span> Checked In <span className="mq-blink">★</span>
         </div>
 
         <div className="overflow-y-auto p-4">
-          <div className="flex gap-3">
-            <div className={`relative h-24 w-24 shrink-0 overflow-hidden ${PX_BORDER}`} style={{ background: cat.tint }}>
-              {photo ? (
-                <img src={photo} alt="" className="h-full w-full object-cover" />
-              ) : (
-                <PixelArt seed={art.id} category={art.category} className="h-full w-full p-2" />
-              )}
-              <span className="absolute bottom-1 right-1 grid h-6 w-6 place-items-center border-2 border-[#141024] bg-[#8ff0c8]">
-                <Check size={14} strokeWidth={3.5} />
-              </span>
+          <div className="flex items-center gap-3">
+            <div className={`relative h-16 w-16 shrink-0 ${PX_BORDER}`} style={{ background: cat.tint }}>
+              <PixelArt seed={art.id} category={art.category} className="h-full w-full p-1.5" />
             </div>
             <div className="min-w-0 flex-1">
-              <p className="font-vt text-[16px] leading-none text-[#7a6fae]">AI MATCH {confidence}%</p>
-              <h2 id="mq-reward-title" className="font-pixel mt-1.5 text-[11.5px] leading-[1.5]">
+              <h2 id="mq-modal-title" className="font-pixel text-[11.5px] leading-[1.5]">
                 {art.name}
               </h2>
-              <p className="font-vt mt-0.5 text-[18px] leading-tight text-[#5b4f8a]">{art.motif}</p>
+              <p className="font-vt text-[20px] leading-none text-[#5b4f8a]">+{cat.points} PTS for finding it</p>
             </div>
           </div>
 
-          <div className={`mq-bump mt-4 flex items-center justify-center gap-2 ${PX_BORDER} bg-[#ffe08a] py-3`}>
-            {isNew ? (
-              <span className="font-pixel text-[18px] leading-none">+{points} PTS</span>
-            ) : (
-              <span className="font-vt text-[20px] leading-none">📷 Photo updated in your collection</span>
-            )}
-          </div>
-
-          <div className="mt-4">
-            <p className="font-vt text-[18px] leading-none text-[#7a6fae]">📜 {isNew ? 'LORE UNLOCKED' : 'LORE'}</p>
-            <p className="mt-1.5 text-[13.5px] leading-relaxed">{art.lore}</p>
-          </div>
+          {!answered ? (
+            <div className="mt-4">
+              <p className="text-[14px] font-bold leading-snug">{quiz.question}</p>
+              <p className="font-vt mt-1 text-[17px] leading-tight text-[#7a6fae]">One try · +{BONUS_POINTS} PTS if you’re right</p>
+              <div className="mt-3 grid gap-2">
+                {quiz.options.map((opt, i) => (
+                  <button
+                    key={opt}
+                    ref={i === 0 ? firstButton : undefined}
+                    type="button"
+                    onClick={() => onAnswer(opt)}
+                    className={`${PX_BTN} font-vt bg-[#ece6ff] px-3 py-2 text-left text-[19px] leading-tight text-[#141024]`}
+                  >
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className={`mq-bump mt-4 ${PX_BORDER} p-3 text-center`} style={{ background: correct ? C.mint : C.butter }}>
+                <p className="font-pixel text-[13px] leading-[1.5]">{correct ? `Correct! +${BONUS_POINTS} bonus` : 'Not quite'}</p>
+                {!correct && <p className="font-vt mt-1 text-[19px] leading-tight">It shows: {quiz.answer}</p>}
+                <p className="font-vt mt-1 text-[19px] leading-none">Total: +{cat.points + (correct ? BONUS_POINTS : 0)} PTS</p>
+              </div>
+              <div className="mt-4">
+                <p className="font-vt text-[18px] leading-none text-[#7a6fae]">📜 LORE UNLOCKED</p>
+                <p className="mt-1.5 text-[13.5px] leading-relaxed">{art.lore}</p>
+              </div>
+            </>
+          )}
         </div>
 
-        <div className="flex gap-2 border-t-[3px] border-[#141024] bg-[#ece6ff] p-3">
-          <button
-            type="button"
-            onClick={onCollection}
-            className={`${PX_BTN} font-pixel flex-1 bg-[#b9a3ff] px-2 py-3 text-[9px] leading-[1.4] text-[#141024]`}
-          >
-            🏅 Collection
-          </button>
-          <button
-            ref={closeRef}
-            type="button"
-            onClick={onKeepHunting}
-            className={`${PX_BTN} font-pixel flex-1 bg-[#ff9ecf] px-2 py-3 text-[9px] leading-[1.4] text-[#141024]`}
-          >
-            🗺️ Keep Hunting
-          </button>
-        </div>
+        {answered && (
+          <div className="flex gap-2 border-t-[3px] border-[#141024] bg-[#ece6ff] p-3">
+            <button type="button" onClick={onCollection} className={`${PX_BTN} font-pixel flex-1 bg-[#b9a3ff] px-2 py-3 text-[9px] leading-[1.4] text-[#141024]`}>
+              🏅 Collection
+            </button>
+            <button
+              ref={firstButton}
+              type="button"
+              onClick={onKeepHunting}
+              className={`${PX_BTN} font-pixel flex-1 bg-[#ff9ecf] px-2 py-3 text-[9px] leading-[1.4] text-[#141024]`}
+            >
+              🗺️ Keep Hunting
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1829,7 +1939,6 @@ select option, select optgroup { font-family: 'Nunito', system-ui, sans-serif; f
   background-image: linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
   background-size: 16px 16px;
 }
-.mq-scanlines { background-image: repeating-linear-gradient(0deg, rgba(255,255,255,.04) 0 2px, transparent 2px 4px); }
 .mq-noscrollbar { scrollbar-width: none; }
 .mq-noscrollbar::-webkit-scrollbar { display: none; }
 
@@ -1844,10 +1953,6 @@ select option, select optgroup { font-family: 'Nunito', system-ui, sans-serif; f
 .mq-blink { animation: mq-blink 1s steps(1) infinite; }
 @keyframes mq-spin { to { transform: rotate(360deg) } }
 .mq-spin { animation: mq-spin 1s steps(8) infinite; }
-@keyframes mq-laser { 0% { top: 8% } 50% { top: 90% } 100% { top: 8% } }
-.mq-laser { top: 8%; animation: mq-laser 2.4s ease-in-out infinite; }
-@keyframes mq-fill { from { width: 0 } to { width: 100% } }
-.mq-fill { width: 0; animation: mq-fill linear forwards; }
 @keyframes mq-pop { 0% { transform: scale(.7); opacity: 0 } 70% { transform: scale(1.04); opacity: 1 } 100% { transform: scale(1) } }
 .mq-pop { animation: mq-pop .32s steps(5); }
 @keyframes mq-drawer-in { from { transform: translateY(105%) } to { transform: translateY(0) } }
@@ -1856,14 +1961,6 @@ select option, select optgroup { font-family: 'Nunito', system-ui, sans-serif; f
 .mq-toast { animation: mq-toast .2s steps(3); }
 @keyframes mq-fade-in { from { opacity: 0; transform: translateY(-4px) } to { opacity: 1; transform: none } }
 .mq-fade-in { animation: mq-fade-in .2s ease-out; }
-
-.mq-loader { position: relative; width: 48px; height: 48px; }
-.mq-loader span { position: absolute; width: 12px; height: 12px; background: #b9a3ff; opacity: .2; animation: mq-loader .8s steps(1) infinite; }
-.mq-loader span:nth-child(1) { left: 0; top: 0 }      .mq-loader span:nth-child(2) { left: 18px; top: 0 }
-.mq-loader span:nth-child(3) { left: 36px; top: 0 }   .mq-loader span:nth-child(4) { left: 36px; top: 18px }
-.mq-loader span:nth-child(5) { left: 36px; top: 36px } .mq-loader span:nth-child(6) { left: 18px; top: 36px }
-.mq-loader span:nth-child(7) { left: 0; top: 36px }   .mq-loader span:nth-child(8) { left: 0; top: 18px }
-@keyframes mq-loader { 0% { opacity: 1; background: #ff9ecf } 12% { opacity: .55; background: #b9a3ff } 25%, 100% { opacity: .2 } }
 
 .mq-confetti { position: absolute; top: -16px; box-shadow: 2px 2px 0 rgba(20,16,36,.6); animation-name: mq-fall; animation-timing-function: cubic-bezier(.25,.6,.45,1); animation-fill-mode: forwards; }
 @keyframes mq-fall { to { transform: translate(var(--drift), 105dvh) rotate(var(--spin)); } }
@@ -1903,7 +2000,7 @@ select option, select optgroup { font-family: 'Nunito', system-ui, sans-serif; f
 @keyframes mq-ring { from { transform: scale(.6); opacity: .9 } to { transform: scale(1.6); opacity: 0 } }
 
 @media (prefers-reduced-motion: reduce) {
-  .mq-confetti, .mq-laser { display: none; }
+  .mq-confetti { display: none; }
   .mq-bob, .mq-blink, .is-selected, .mq-user-ring, .mq-drawer-in, .mq-pop { animation: none !important; }
 }
 `;
@@ -1923,27 +2020,32 @@ export default function App() {
   const [tab, setTab] = useState('map');
   const [filter, setFilter] = useState('all');
   const [selectedId, setSelectedId] = useState(null);
-  const [scanTargetId, setScanTargetId] = useState(null);
+  const [focusRequest, setFocusRequest] = useState(null);
+  const [targetIdState, setTargetId] = useState(null);
   const [highlightId, setHighlightId] = useState(null);
   const [userPos, setUserPos] = useState(null);
-  const [reward, setReward] = useState(null);
+  const [session, setSession] = useState(null);
   const [toast, showToast] = useToast();
   const sfx = useSfx(sound);
 
   const points = useMemo(
-    () => Object.keys(unlocked).reduce((sum, id) => sum + (ART_BY_ID[id] ? CATEGORIES[ART_BY_ID[id].category].points : 0), 0),
+    () =>
+      Object.entries(unlocked).reduce(
+        (sum, [id, entry]) => sum + (ART_BY_ID[id] ? CATEGORIES[ART_BY_ID[id].category].points + (entry?.bonus ? BONUS_POINTS : 0) : 0),
+        0,
+      ),
     [unlocked],
   );
   const found = Object.keys(unlocked).filter((id) => ART_BY_ID[id]).length;
 
-  /** Default scan target: nearest locked artwork (or first locked one without GPS). */
+  /** Default target: nearest locked artwork (or the first locked one without GPS). */
   const defaultTargetId = useMemo(() => {
     const locked = ARTWORKS.filter((a) => !unlocked[a.id]);
     const pool = locked.length ? locked : ARTWORKS;
     if (!userPos) return pool[0].id;
     return [...pool].sort((a, b) => distanceMeters(userPos, a) - distanceMeters(userPos, b))[0].id;
   }, [unlocked, userPos]);
-  const targetId = scanTargetId ?? defaultTargetId;
+  const targetId = targetIdState ?? defaultTargetId;
 
   const goTab = (next) => {
     if (next === tab) return;
@@ -1953,23 +2055,27 @@ export default function App() {
     setHighlightId(null);
   };
 
-  const selectArtwork = (id) => {
+  const selectArtwork = (id, opts = {}) => {
     if (id && id !== selectedId) sfx.open();
     setSelectedId(id);
+    setFocusRequest(id && opts.exact ? { id, n: Date.now() } : null);
   };
 
-  const startScan = (id) => {
+  /** From the map/collection: go to the Check In tab with this target. */
+  const goCheckIn = (id) => {
     sfx.open();
-    setScanTargetId(id);
+    setTargetId(id);
     setSelectedId(null);
-    setTab('scan');
+    setTab('checkin');
   };
 
-  const showOnMap = (id) => {
+  /** Show a spot on the map; `exact` zooms right in. */
+  const showOnMap = (id, exact = false) => {
     sfx.tap();
     setFilter('all');
     setTab('map');
     setSelectedId(id);
+    setFocusRequest(exact ? { id, n: Date.now() } : null);
   };
 
   const toggleSound = () => {
@@ -1978,28 +2084,40 @@ export default function App() {
     if (next) sfx.preview();
   };
 
-  const handleVerified = (id, photo) => {
+  /** Called from the Check In tab once GPS says you're in range (or from the demo button). */
+  const handleCheckIn = (id, { demo = false } = {}) => {
     const art = ART_BY_ID[id];
-    const isNew = !unlocked[id];
-    setSave((s) => ({
-      ...s,
-      unlocked: { ...s.unlocked, [id]: { at: s.unlocked[id]?.at ?? Date.now(), photo: photo ?? s.unlocked[id]?.photo ?? null } },
-    }));
-    setReward({
-      art,
-      photo,
-      isNew,
-      points: isNew ? CATEGORIES[art.category].points : 0,
-      confidence: (92 + Math.random() * 7.5).toFixed(1),
-    });
-    sfx.success();
+    if (!art || unlocked[id]) return;
+    if (!demo) {
+      const ok = userPos && distanceMeters(userPos, art) <= CHECKIN_RADIUS_M && (userPos.acc || 999) <= MAX_GPS_ACCURACY_M;
+      if (!ok) {
+        sfx.error();
+        showToast(`Get within ${CHECKIN_RADIUS_M} m of the spot to check in`, 'error');
+        return;
+      }
+    }
+    setSave((s) => ({ ...s, unlocked: { ...s.unlocked, [id]: { at: Date.now(), bonus: false } } }));
+    setSession({ art, quiz: buildQuiz(art), picked: null });
+    sfx.checkIn();
     navigator.vibrate?.([30, 40, 60]);
   };
 
-  const closeReward = (destination) => {
-    const id = reward?.art.id;
-    setReward(null);
-    setScanTargetId(null);
+  const handleAnswer = (option) => {
+    if (!session || session.picked != null) return;
+    const correct = option === session.quiz.answer;
+    if (correct) {
+      setSave((s) => ({ ...s, unlocked: { ...s.unlocked, [session.art.id]: { ...s.unlocked[session.art.id], bonus: true } } }));
+      sfx.success();
+    } else {
+      sfx.error();
+    }
+    setSession((s) => ({ ...s, picked: option }));
+  };
+
+  const closeSession = (destination) => {
+    const id = session?.art.id;
+    setSession(null);
+    setTargetId(null);
     sfx.tap();
     if (destination === 'collection') {
       setHighlightId(id);
@@ -2016,7 +2134,7 @@ export default function App() {
   };
 
   return (
-    <div id="mq-app" className="relative mx-auto flex h-[100dvh] w-full max-w-md flex-col overflow-hidden bg-[#1d1934] text-[#fff7fb] select-none">
+    <div id="mq-app" className="relative mx-auto flex h-[100dvh] w-full max-w-md select-none flex-col overflow-hidden bg-[#1d1934] text-[#fff7fb]">
       <GlobalStyles />
 
       <Header points={points} sound={sound} onToggleSound={toggleSound} />
@@ -2031,22 +2149,25 @@ export default function App() {
             onFilter={setFilter}
             selectedId={selectedId}
             onSelect={selectArtwork}
+            focusRequest={focusRequest}
             userPos={userPos}
             onUserPos={setUserPos}
-            onScan={startScan}
+            onCheckIn={goCheckIn}
             toast={showToast}
             sfx={sfx}
           />
         </div>
 
-        {tab === 'scan' && (
-          <ScanView
+        {tab === 'checkin' && (
+          <CheckInView
             unlocked={unlocked}
             targetId={targetId}
-            onTarget={setScanTargetId}
-            onVerified={handleVerified}
+            onTarget={setTargetId}
+            userPos={userPos}
+            onUserPos={setUserPos}
+            onCheckIn={handleCheckIn}
+            onShowExact={(id) => showOnMap(id, true)}
             sfx={sfx}
-            toast={showToast}
           />
         )}
 
@@ -2055,8 +2176,9 @@ export default function App() {
             unlocked={unlocked}
             points={points}
             highlightId={highlightId}
-            onShowOnMap={showOnMap}
-            onScan={startScan}
+            onShowOnMap={(id) => showOnMap(id)}
+            onShowExact={(id) => showOnMap(id, true)}
+            onCheckIn={goCheckIn}
             onReset={resetProgress}
             sfx={sfx}
           />
@@ -2067,12 +2189,8 @@ export default function App() {
 
       <BottomNav tab={tab} onChange={goTab} found={found} />
 
-      {reward && (
-        <RewardModal
-          reward={reward}
-          onCollection={() => closeReward('collection')}
-          onKeepHunting={() => closeReward('map')}
-        />
+      {session && (
+        <CheckInModal session={session} onAnswer={handleAnswer} onCollection={() => closeSession('collection')} onKeepHunting={() => closeSession('map')} />
       )}
     </div>
   );

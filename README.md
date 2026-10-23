@@ -33,13 +33,28 @@ To install it as a home-screen app, deploy `/dist` to any HTTPS host (Netlify, V
 | `public/manifest.webmanifest`, `public/sw.js`, icons | PWA install, offline shell, cached map tiles |
 | `preview.html` | Standalone build of the same `App.jsx` |
 
+## How a spot is collected
+1. **Find it:** use the map pins, the 3-level hints ("More help"), and the Check In tab's live radar, which shows distance, direction and how close you are.
+2. **Check in:** the button only unlocks when your phone's GPS puts you within **75 m** of the pin and the GPS reading is accurate to 100 m or better.
+3. **Bonus question:** pick what the artwork shows, from 4 choices. The motif stays hidden until you've checked in. You get one try, worth +25 points.
+
+Testing at home: `npm run dev` and `preview.html` show a "Demo only: pretend I'm there" link. Real Vercel builds never show it.
+
 ## Customising
-- **Spots:** edit the `ARTWORKS` array in `App.jsx`. Each spot has `name, motif, lat, lng, district, category, hint, trivia, lore`.
-- **Points per category:** `CATEGORIES` (pixel 50, legal wall 75, mural 100).
+- **Spots:** edit the `ARTWORKS` array in `src/App.jsx`. Each spot has `name, motif, lat, lng, district, category, hint, closer, trivia, lore`.
+  - `hint` is the first hint: the area.
+  - `closer` is the second hint, shown under "More help": where around the pin to search.
+  - The third hint, "What to look for", comes from the category (`CATEGORIES[...].lookFor`).
+- **Fix a pin on site:** if an artwork is somewhere else, update its `lat`/`lng`. To read the coordinates, long-press the spot in Google Maps. Then adjust its `closer` text.
+- **Custom bonus question:** add `quiz: { question: '…', answer: '…', options: ['…', '…', '…', '…'] }` to a spot. The options must include the answer. Without it, the question is "What does this artwork show?", with 3 other motifs as decoys.
+- **Rules:** `CHECKIN_RADIUS_M` (75), `MAX_GPS_ACCURACY_M` (100), `BONUS_POINTS` (25), and `CATEGORIES[...].points` for each category.
 - **Colours:** the `C` palette object and the pin CSS in `GLOBAL_CSS`.
-- **Real AI verification:** the scan is simulated. It shows a 2-second analysis animation, then always succeeds. To verify for real, replace the `setTimeout` in `ScanView.analyze()` with a call to your vision API. Pass it the photo data URL and the target artwork, and call `onVerified()` only when it matches.
+
+## Hosting
+Vercel's free Hobby plan suits this app. It provides HTTPS, which phones require for GPS, and redeploys automatically when you push to GitHub. The plan is for personal, non-commercial use only. If the app becomes a paid or client project, Vercel's Pro plan is required. The app is a static site, so Netlify, Cloudflare Pages or GitHub Pages work too.
 
 ## Notes
-- Progress, points and your scan photos are saved in the browser's `localStorage`. Photos are shrunk to about 720 px so they fit.
+- Progress and points are saved in each player's browser (`localStorage`).
 - Sound effects are generated with the Web Audio API, so there are no audio files.
-- The spot coordinates and motifs come from the original brief. Check them on the ground before sending real players out.
+- GPS can be 20–50 m off between tall buildings. The radar says when the signal is too vague and asks you to step into the open.
+- The spot coordinates and motifs come from the original brief. Check them on the ground and fix any that are off.
